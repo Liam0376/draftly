@@ -1,0 +1,36 @@
+export function posBadge(pos) {
+  const p = (pos || 'UNK').toUpperCase().slice(0,3);
+  return `<span class="badge badge-pos" data-pos="${p}">${p}</span>`;
+}
+export function injuryBadge(status) {
+  if (!status || status === 'Healthy' || status === 'Active') return `<span class="badge-injury healthy">● Healthy</span>`;
+  const s = String(status);
+  const cls = /out|ir|injured reserve/i.test(s) ? 'out' : /questionable|doubtful|limited/i.test(s) ? 'questionable' : 'questionable';
+  return `<span class="badge-injury ${cls}">● ${s}</span>`;
+}
+export function windBadge(wind) {
+  const w = Number(wind ?? 0);
+  if (!w || w <= 0) return `<span class="badge-wind ok">—</span>`;
+  const level = w > 20 ? 'bad' : w > 15 ? 'warn' : 'ok';
+  const label = w > 15 ? `${w.toFixed(0)} mph` : `${w.toFixed(0)} mph`;
+  return `<span class="badge-wind ${level}">${level === 'ok' ? '◍' : '⚑'} ${label}</span>`;
+}
+export function confBadge(width) {
+  // why no HIGH (calibration honesty batch 2026-09-12): clamp min is 3.0
+  // in every interval path, so w < 3 never fires and promised precision
+  // that never emits. MED/WIDE only.
+  const w = Number(width ?? 5);
+  const label = w < 6 ? 'MED' : 'WIDE';
+  const cls = w < 6 ? 'medium' : 'low';
+  return `<span class="badge" style="background:${cls==='medium'?'var(--amber-dim)':'rgba(var(--text-rgb,0,0,0),0.05)'}; color:${cls==='medium'?'var(--amber)':'var(--text-muted)'}; border:1px solid ${cls==='medium'?'rgba(245,158,11,0.2)':'var(--border)'}">${label} · ±${w.toFixed(1)}</span>`;
+}
+export function matchupBadge(diff, rank, ptsAllowed) {
+  // Difficulty of the offensive matchup from the opponent's positional
+  // points-allowed rank (1 = allows fewest = hardest defense). Rank is
+  // repeated in the tooltip so the polarity is never ambiguous.
+  if (!diff || rank == null) return '';
+  const c = diff === 'EASY' ? 'var(--emerald)' : diff === 'HARD' ? 'var(--crimson)' : 'var(--amber)';
+  const pts = ptsAllowed != null ? `allows ${Number(ptsAllowed).toFixed(1)}/g` : 'no allowance data';
+  const title = `${pts} — ranked #${rank} of 32 defenses (1 = toughest)`.replace(/"/g, '&quot;');
+  return `<span class="badge" title="${title}" style="background:color-mix(in srgb, ${c} 12%, transparent); color:${c}; border:1px solid color-mix(in srgb, ${c} 25%, transparent); margin-left:6px">${diff} #${rank}</span>`;
+}

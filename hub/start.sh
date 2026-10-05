@@ -1,0 +1,305 @@
+#!/bin/bash
+# hub/start.sh — one-click warm-boot launcher. Starts model+proxy+hub, ensures DATA is warm before opening browser.
+# 127.0.0.1 only — never bind 0.0.0.0 (see docs/RUNBOOK.md and CLAUDE.md hard constraints).
+# Flags: --auto (auto-refresh if stale, no prompt), --no-refresh (never POST, open even if cold), --force (refresh even if fresh), --no-browser (skip opening browser), --lan (explicit opt-in: display LAN URL with warning; default stays 127.0.0.1 local-only), --league <id> (sync + serve this Sleeper league; default: $SLEEPER_LEAGUE_ID or test)
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# flags
+AUTO=0
+NO_REFRESH=0
+FORCE=0
+NO_BROWSER=0
+LAN=0
+LEAGUE_ARG=""
+args=("$@")
+i=0
+while [ $i -lt $# ]; do
+  arg="${args[$i]}"
+  case "$arg" in
+    --auto) AUTO=1 ;;
+    --no-refresh) NO_REFRESH=1 ;;
+    --force) FORCE=1 ;;
+    --no-browser) NO_BROWSER=1 ;;
+    --lan) LAN=1 ;;
+    --league) i=$((i+1)); LEAGUE_ARG="${args[$i]:-}";;
+    --league=*) LEAGUE_ARG="${arg#--league=}" ;;
+    -h|--help) echo "Usage: bash hub/start.sh [--auto] [--no-refresh] [--force] [--no-browser] [--lan] [--league <sleeper-id>]"; exit 0 ;;
+  esac
+  i=$((i+1))
+done
+if [ -n "$LEAGUE_ARG" ]; then
+  case "$LEAGUE_ARG" in
+    ''|*[!0-9]*) echo "error: --league needs a numeric Sleeper league id, got '$LEAGUE_ARG'"; exit 2 ;;
+  esac
+fi
+
+export SLEEPER_LEAGUE_ID="${LEAGUE_ARG:-${SLEEPER_LEAGUE_ID:-test}}"
+
+# Local-only default: all services bind 127.0.0.1. LAN URL display requires
+# explicit --lan opt-in (see warning below). No hardcoded user paths —
+# REPO_ROOT is derived from the script location.
+LAN_IP="127.0.0.1"
+if [ "$LAN" = "1" ]; then
+  LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")
+  echo "⚠ WARNING: --lan violates the local-only constraint (127.0.0.1 only, never 0.0.0.0, no tunnels)."
+  echo "  The Vite proxy still binds 127.0.0.1 by default, so http://${LAN_IP}:8001 will NOT"
+  echo "  respond unless you deliberately rebind — which is outside the supported OSS setup."
+  echo "  Explicit opt-in acknowledged; continuing local-only."
+fi
+
+echo "→ Draftly — warm-boot start (Ctrl+C to stop, 0 resources after)"
+echo "  Model: http://127.0.0.1:8000   Hub: http://127.0.0.1:8001   Proxy: http://127.0.0.1:8002"
+echo "  Flags: auto=$AUTO no-refresh=$NO_REFRESH force=$FORCE no-browser=$NO_BROWSER lan=$LAN league=$SLEEPER_LEAGUE_ID"
+echo ""
+
+# Blast-radius guard for lsof reclaim: only kill PIDs whose command looks like
+# our stack (python/uvicorn/vite/node/npm). Anything else (e.g. an unrelated
+# service on the same port) is warned about and skipped, never killed.
+safe_kill_port() {
+  local port="$1"
+  local pids
+  pids=$(lsof -ti :"$port" 2>/dev/null || true)
+  [ -z "$pids" ] && return 0
+  local pid cmd
+  for pid in $pids; do
+    cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+    case "$cmd" in
+      *python*|*uvicorn*|*node*|*vite*|*npm*)
+        echo "  • port $port pid $pid ($cmd) — reclaiming (previous hub instance)…"
+        kill "$pid" 2>/dev/null || true
+        ;;
+      *)
+        echo "  ⚠ port $port pid $pid ($cmd) not ours (expected python/uvicorn/vite/node) — skipping kill"
+        ;;
+    esac
+  done
+}
+
+cleanup() {
+  echo ""
+  echo "→ stopping…"
+  jobs -p | xargs -I {} kill {} 2>/dev/null || true
+  safe_kill_port 8000 || true
+  safe_kill_port 8001 || true
+  safe_kill_port 8002 || true
+  echo "✓ stopped — 0 processes left"
+  exit 0
+}
+trap cleanup INT TERM EXIT
+
+# 0) If ports already in use from previous run (you double-clicked), reclaim them gracefully
+for p in 8000 8001 8002; do
+  if lsof -ti :$p >/dev/null 2>&1; then
+    safe_kill_port "$p" || true
+    sleep 1
+  fi
+done
+
+# 1) Model API
+echo "→ starting model API :8000…"
+if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+  echo "  ✓ model already running on :8000 — reusing"
+  API_PID=""
+else
+  # why --reload-dir, not bare --reload (user-caught live bug, 2026-09-10):
+  # bare --reload watches the whole repo — an edit to hub/server.py or
+  # tests/*.py (nothing to do with the model) silently restarted this
+  # process, wiping the in-memory refresh cache. /games/predictions (and
+  # everything else) 503'd until someone noticed and re-ran /refresh.
+  # Scoping the watch to the model's own source stops that.
+  .venv/bin/uvicorn ffanalytics.api:app --host 127.0.0.1 --port 8000 --reload --reload-dir src/ffanalytics > /tmp/draftly-api.log 2>&1 &
+  API_PID=$!
+  for i in {1..30}; do
+    if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  if ! curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+    echo "✗ model failed to start — see /tmp/draftly-api.log"
+    cat /tmp/draftly-api.log | tail -20
+    exit 1
+  fi
+  echo "  ✓ model up (pid $API_PID)"
+fi
+
+# ensure DB + schema exists via init_schema warm-boot (step 1) — delegated to
+# scripts/db_warm.py, which calls db.init_schema(), before any refresh check.
+# (hub scripts must not import ffanalytics; see docs/architecture-decisions/0002-hub-isolation.md)
+.venv/bin/python scripts/db_warm.py 2>&1 | head -5
+
+# 2) Hub proxy (127.0.0.1 only)
+echo "→ starting hub proxy :8002 (mode=ro)…"
+if curl -sf http://127.0.0.1:8002/health >/dev/null 2>&1; then
+  echo "  ✓ proxy already running on :8002 — reusing"
+  PROXY_PID=""
+else
+  .venv/bin/python hub/server.py > /tmp/draftly-proxy.log 2>&1 &
+  PROXY_PID=$!
+  for i in {1..20}; do
+    if curl -sf http://127.0.0.1:8002/health >/dev/null 2>&1; then break; fi
+    sleep 0.3
+  done
+  if ! curl -sf http://127.0.0.1:8002/health >/dev/null 2>&1; then
+    echo "⚠ proxy not responding — hub will work API-only (see /tmp/draftly-proxy.log)"
+  else
+    # verify all 9 hub API endpoints respond
+    ALL_OK=1
+    for ep in health hub-api/meta hub-api/projections hub-api/matchups hub-api/roster hub-api/news hub-api/refresh-log hub-api/team-ratings hub-api/waiver; do
+      if ! curl -sf http://127.0.0.1:8002/$ep >/dev/null 2>&1; then
+        ALL_OK=0
+        echo "  ⚠ endpoint /$ep failed health check"
+      fi
+    done
+    if [ "$ALL_OK" = "1" ]; then
+      echo "  ✓ proxy up & all 9 endpoints healthy (pid $PROXY_PID)"
+    else
+      echo "  ⚠ proxy up but some endpoints failed — see /tmp/draftly-proxy.log"
+    fi
+  fi
+fi
+
+# 3) Warm-boot staleness check (model warm, not just process warm)
+echo "→ checking data freshness…"
+META_JSON=$(curl -sf http://127.0.0.1:8002/hub-api/meta 2>/dev/null || curl -sf http://127.0.0.1:8000/health 2>/dev/null | sed 's/.*//')
+# parse via python for robustness
+STALENESS=$(SLEEPER_LEAGUE_ID="$SLEEPER_LEAGUE_ID" .venv/bin/python << 'PY'
+import json, requests, datetime, pathlib
+try:
+    r=requests.get("http://127.0.0.1:8002/hub-api/meta", timeout=3).json()
+    last=r.get("lastUpdated") or r.get("last_updated")
+    week=r.get("week")
+    season=r.get("season")
+    counts=r.get("counts",{})
+    stale=False
+    reason=""
+    if not last:
+        stale=True; reason="cold — no refresh_log"
+    else:
+        try:
+            age=(datetime.datetime.now() - datetime.datetime.fromisoformat(last)).total_seconds()/3600
+            if age>24:
+                stale=True; reason=f"stale {age:.1f}h ago (>24h threshold)"
+        except: stale=True; reason="bad timestamp"
+    # also cold if player_stats empty
+    if counts.get("player_stats",0)==0:
+        stale=True; reason="cold — player_stats 0"
+    print(f"{'stale' if stale else 'fresh'}|{last or ''}|{reason}|{week or ''}|{season or ''}")
+except Exception as e:
+    print(f"unknown||{e}||")
+PY
+)
+STALENESS_STATE=$(echo "$STALENESS" | cut -d'|' -f1)
+LAST_TS=$(echo "$STALENESS" | cut -d'|' -f2)
+REASON=$(echo "$STALENESS" | cut -d'|' -f3)
+WEEK=$(echo "$STALENESS" | cut -d'|' -f4)
+echo "  • freshness: $STALENESS_STATE ${LAST_TS:+($LAST_TS)} ${REASON:+— $REASON} ${WEEK:+week $WEEK}"
+
+SHOULD_REFRESH=0
+if [ "$FORCE" = "1" ]; then
+  SHOULD_REFRESH=1
+  echo "  → --force: will refresh even if fresh"
+elif [ "$NO_REFRESH" = "1" ]; then
+  SHOULD_REFRESH=0
+  echo "  → --no-refresh: skipping refresh, opening even if $STALENESS_STATE"
+elif [ "$STALENESS_STATE" = "stale" ] || [ "$STALENESS_STATE" = "unknown" ]; then
+  if [ "$AUTO" = "1" ]; then
+    SHOULD_REFRESH=1
+    echo "  → stale — auto-refreshing ( --auto )…"
+  else
+    # prompt, default Y
+    printf "  → data %s — refresh now? [Y/n] " "$STALENESS_STATE"
+    read -r ans || ans="Y"
+    case "$ans" in
+      [nN]*) SHOULD_REFRESH=0; echo "  → skipping refresh per user" ;;
+      *) SHOULD_REFRESH=1; echo "  → refreshing…" ;;
+    esac
+  fi
+else
+  echo "  → fresh — skipping refresh"
+fi
+
+if [ "$SHOULD_REFRESH" = "1" ]; then
+  echo "  → POST http://127.0.0.1:8000/refresh (per-source isolated)…"
+  # honor 1h throttle: check refresh_log
+  LAST_REFRESH_AGE=$(SLEEPER_LEAGUE_ID="$SLEEPER_LEAGUE_ID" .venv/bin/python << 'PY'
+import datetime, json, requests
+try:
+    r=requests.get("http://127.0.0.1:8002/hub-api/refresh-log", timeout=3).json()
+    entries=[e for e in r.get("entries",[]) if e.get("success") == 1]
+    if entries:
+        last=entries[0].get("ran_at")
+        age=(datetime.datetime.now() - datetime.datetime.fromisoformat(last)).total_seconds()/60 if last else 999
+        print(f"{age:.0f}")
+    else:
+        print("999")
+except: print("999")
+PY
+)
+  if [ "$LAST_REFRESH_AGE" != "999" ] && [ "$LAST_REFRESH_AGE" -lt 60 ] && [ "$FORCE" != "1" ]; then
+    echo "  ⚠ last refresh ${LAST_REFRESH_AGE}m ago (<60m) — skipping to respect Sleeper players/nfl rate limit (use --force to override)"
+    SHOULD_REFRESH=0
+  else
+    START_TS=$(date +%s)
+    if curl -sf -X POST http://127.0.0.1:8000/refresh -H "Content-Type: application/json" 2>/dev/null | head -20 > /tmp/draftly-refresh.json; then
+      cat /tmp/draftly-refresh.json | head -20
+      ELAPSED=$(( $(date +%s) - START_TS ))
+      echo "  ✓ refresh done in ${ELAPSED}s (per-source isolation — one failure doesn't abort others)"
+      # verify warm: cache or DB has player_stats
+      for i in {1..10}; do
+        WARM=$(curl -sf http://127.0.0.1:8002/hub-api/meta 2>/dev/null | grep -o '"player_stats":[^,]*' | head -1 || echo "")
+        if echo "$WARM" | grep -qv '"player_stats":0'; then break; fi
+        sleep 0.5
+      done
+    else
+      echo "  ⚠ POST /refresh failed — hub will open with stale cache (see /tmp/draftly-api.log, trap won't abort)"
+    fi
+  fi
+fi
+
+# 3b) Preseason auto-seed — so single click always shows a working interface (no manual curl needed)
+if curl -sf http://127.0.0.1:8002/hub-api/projections 2>/dev/null | grep -q '"count": 0'; then
+  echo "  → still empty (preseason week 0) — seeding demo 2024 week 10 so Projections isn't empty…"
+  SLEEPER_LEAGUE_ID="$SLEEPER_LEAGUE_ID" .venv/bin/python scripts/seed_demo.py 2>&1 | sed 's/^/    /' || echo "  ⚠ demo seed failed — hub will show empty state until in-season (not fatal)"
+  echo "  ✓ demo check done"
+fi
+
+# 4) Hub UI
+echo "→ starting hub UI :8001…"
+if curl -sf http://127.0.0.1:8001/ >/dev/null 2>&1; then
+  echo "  ✓ hub already running on :8001 — reusing"
+  if [ "$NO_BROWSER" = "0" ]; then
+    echo "  → opening browser…"
+    open http://127.0.0.1:8001 2>/dev/null || xdg-open http://127.0.0.1:8001 2>/dev/null || true
+  fi
+  echo ""
+  echo "  ┌─────────────────────────────────────────────────────┐"
+  echo "  │  Draftly ready (local-only)                         │"
+  echo "  │  Mac:    http://127.0.0.1:8001                      │"
+  echo "  └─────────────────────────────────────────────────────┘"
+  if [ "$LAN" = "1" ]; then
+    echo "  ⚠ --lan opt-in: LAN URL http://${LAN_IP}:8001 shown for reference only."
+    echo "    Services still bind 127.0.0.1; LAN access requires deliberate rebind (unsupported)."
+  fi
+  echo ""
+  wait
+else
+  if [ ! -d "hub/node_modules" ]; then
+    echo "  installing hub deps (once)…"
+    npm install --prefix hub --silent
+  fi
+  if [ "$NO_BROWSER" = "0" ]; then
+    ( sleep 1.2 && open http://127.0.0.1:8001 2>/dev/null || xdg-open http://127.0.0.1:8001 2>/dev/null || true ) &
+  fi
+  echo ""
+  echo "  ┌─────────────────────────────────────────────────────┐"
+  echo "  │  Draftly ready (local-only)                         │"
+  echo "  │  Mac:    http://127.0.0.1:8001                      │"
+  echo "  └─────────────────────────────────────────────────────┘"
+  if [ "$LAN" = "1" ]; then
+    echo "  ⚠ --lan opt-in: LAN URL http://${LAN_IP}:8001 shown for reference only."
+    echo "    Services still bind 127.0.0.1; LAN access requires deliberate rebind (unsupported)."
+  fi
+  echo ""
+  npm --prefix hub run dev
+fi
