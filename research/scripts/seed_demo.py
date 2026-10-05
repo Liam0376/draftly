@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Seed demo projections into fantasy.db at week 0 so hub shows 300+ players even in preseason week 0. Run automatically by hub/start.sh when player_stats is empty.
+
+Week 0 matters: hub queries prefer the highest week <= current, so a demo
+row at week 1 outranks live week-0 data until week 1 games pass."""
+import json, pathlib, sys
+# cwd-independent: resolve repo root via __file__
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+import os
+# why require (not setdefault): multi-league — seeding another league's id
+# here would mislabel demo data; the id always comes from the environment
+# (start.sh passes SLEEPER_LEAGUE_ID through).
+if not os.environ.get("SLEEPER_LEAGUE_ID"):
+    raise SystemExit("seed_demo: SLEEPER_LEAGUE_ID env var must be set (refusing to seed the wrong league)")
+os.environ.setdefault("FFANALYTICS_DB_PATH", str(REPO_ROOT / "data" / "fantasy.db"))
+from ffanalytics import db
+from ffanalytics.stat_projector import build_weekly_projections
+import requests
+REPO_CACHE = REPO_ROOT / "data" / "nfl_cache"
+CACHE = REPO_CACHE
+stats_path = CACHE/"stats_2025.json" if (CACHE/"stats_2025.json").exists() else CACHE/"stats_2024.json"
+schedule_path = CACHE/"schedule_2025.json" if (CACHE/"schedule_2025.json").exists() else CACHE/"schedule_2024.json"
+stats_2025=json.loads(stats_path.read_text())
+# prefer live 2026 schedule via nflreadpy (PIT@CIN etc.), fallback to 2025 cache
+try:
+    import nflreadpy
+    sched_frame=nflreadpy.load_schedules(seasons=[2026])
+    schedule_2026=sched_frame.to_dicts()
+    # cache it for next time
+    try:
+        (REPO_CACHE/"schedule_2026.json").parent.mkdir(parents=True, exist_ok=True)
+        with open(REPO_CACHE/"schedule_2026.json","w") as f: json.dump(schedule_2026,f)
+    except Exception:
+        pass
+    schedule=schedule_2026
+    print(f"using live 2026 schedule ({len(schedule)} games) + {stats_path.name}")
+except Exception as e:
+    print(f"live 2026 schedule fetch failed ({e}) — fallback to {schedule_path.name}")
+    schedule=json.loads(schedule_path.read_text())
+    stats_2025=stats_2025  # keep as stats_2025 for naming
+league_resp = requests.get(f"https://api.sleeper.app/v1/league/{os.environ['SLEEPER_LEAGUE_ID']}",timeout=10).json()
+if not isinstance(league_resp, dict):
+    raise SystemExit(f"seed_demo: league {os.environ['SLEEPER_LEAGUE_ID']} not found on Sleeper (check SLEEPER_LEAGUE_ID)")
+scoring = league_resp.get("scoring_settings", {})
+# build weekly projections for week 1 — use 2025 stats as history (most recent complete season)
+from collections import Counter
+game_counts = Counter(r.get("player_id") for r in stats_2025 if r.get("season_type") == "REG")
+filtered_stats_2025 = [r for r in stats_2025 if game_counts.get(r.get("player_id"), 0) >= 4]
+projs=build_weekly_projections(filtered_stats_2025, schedule, target_week=1, scoring_settings=scoring)
+# Sleeper team override for 2026 offseason moves
+try:
+    sleeper=requests.get("https://api.sleeper.app/v1/players/nfl", timeout=30).json()
+    name_to_team={p["full_name"]: p["team"] for p in sleeper.values() if p.get("full_name") and p.get("team")}
+    from ffanalytics.adapters.schedule import get_nfl_team_matchups
+    opp_map=get_nfl_team_matchups(schedule, 1)
+    patched=0
+    for p in projs:
+        nm=p.get("player_display_name")
+        if nm in name_to_team and name_to_team[nm]:
+            new_team=name_to_team[nm]
+            if p.get("team")!=new_team:
+                patched+=1
+            p["team"]=p["recent_team"]=new_team
+        p["opponent_team"]=opp_map.get(p.get("team",""),"")
+    print(f"Sleeper patch: {patched} teams corrected for 2026")
+except Exception as e:
+    print(f"Sleeper patch skipped ({e})")
+    projs=projs  # keep original
+# sanitize NaN/Inf for SQLite JSON
+import math
+for p in projs:
+    for k,v in list(p.items()):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            p[k]=0
+conn=db.get_connection()
+db.init_schema(conn)
+# clean empty/invalid rows
+try:
+    conn.execute("DELETE FROM player_stats WHERE data='[]' OR data='null' OR length(data)<10")
+    for r in list(conn.execute("SELECT rowid, data FROM player_stats")):
+        try:
+            d=json.loads(r["data"])
+            if not isinstance(d, list) or len(d)<10:
+                if len(d)==0:
+                    conn.execute("DELETE FROM player_stats WHERE rowid=?", (r["rowid"],))
+        except Exception:
+            conn.execute("DELETE FROM player_stats WHERE rowid=?", (r["rowid"],))
+except Exception: pass
+try:
+    # week=1 clears legacy demo rows from earlier runs; week=0 clears our own rerun
+    conn.execute("DELETE FROM player_stats WHERE season=2026 AND week IN (0, 1)")
+except Exception: pass
+conn.execute("INSERT INTO player_stats (season, week, data) VALUES (?, ?, ?)", (2026, 0, json.dumps(projs, allow_nan=False)))
+# why insert-only-if-missing: league_settings holds live Sleeper truth (users,
+# reserve_slots, budget); a stripped demo row must never clobber it.
+exists = conn.execute("SELECT 1 FROM league_settings WHERE season=2026 LIMIT 1").fetchone()
+if not exists:
+    conn.execute("INSERT OR REPLACE INTO league_settings (season, data) VALUES (?, ?)", (2026, json.dumps({"scoring_settings": scoring, "roster_positions": ["QB","RB","RB","WR","WR","TE","FLEX","FLEX","K","DEF","BN","BN","BN","BN"]})))
+import datetime
+conn.execute("INSERT INTO refresh_log (source, ran_at, success, error_message) VALUES (?, ?, ?, ?)", ("demo-seed-auto", datetime.datetime.now().isoformat(), 1, None))
+conn.commit()
+conn.close()
+print(f"seeded {len(projs)} demo projections for 2026 week 0")
