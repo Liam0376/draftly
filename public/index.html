@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Draftly" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Poppins:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <title>Draftly — Fantasy Football Analytics</title>
+    <meta name="description" content="Local fantasy football command center — projections, matchups, weather, tierlists, and auction draft guide." />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏈</text></svg>" />
+    <script type="module" crossorigin src="/assets/index-CFYKaGey.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-V8f3eWSH.css">
+  </head>
+  <body>
+    <a href="#app" class="skip-link">Skip to main content</a>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar" aria-label="Primary">
+        <div class="sidebar-brand">
+          <div class="nav-logo">DL</div>
+          <div>
+            <div class="nav-title">DRAFTLY</div>
+            <div class="nav-sub">—</div>
+          </div>
+        </div>
+        <nav class="sidebar-nav" id="navTabs" role="tablist" aria-label="Sections"></nav>
+        <div class="sidebar-foot">
+          <div class="staleness" id="stalenessTop" style="display:none"></div>
+        </div>
+      </aside>
+      <div class="main">
+        <header class="topbar" id="topbar">
+          <label class="search-top" aria-label="Global search">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="globalSearch" placeholder="Search players, teams…  ( / )" autocomplete="off" />
+          </label>
+          <div class="topbar-right">
+            <button id="themeToggle" class="btn-icon" title="Toggle theme" aria-label="Toggle dark mode">
+              <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+              <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+            </button>
+            <div class="staleness" id="staleness" title="Data freshness"><span class="dot cold" id="staleDot"></span><span id="staleText">checking…</span></div>
+          </div>
+          <div id="searchDropdown" class="search-dropdown" style="display:none; position:absolute; top:calc(100% + 8px); left:50%; transform:translateX(-50%); width:min(640px, 92vw); max-height:420px; overflow-y:auto; background:var(--surface); border:1px solid var(--border-strong); border-radius:6px; box-shadow:0 16px 36px rgba(0,0,0,0.12); z-index:1000; padding:6px"></div>
+        </header>
+        <main class="page" id="app">
+          <div class="empty">Loading…</div>
+        </main>
+      </div>
+    </div>
+    <div id="mobileNav"></div>
+  </body>
+</html>
