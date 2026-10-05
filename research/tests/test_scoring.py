@@ -1,0 +1,80 @@
+from ffanalytics.scoring import (
+    calculate_fantasy_points,
+    apply_flex_adjustment,
+    count_flex_slots,
+    DEFAULT_SCORING,
+)
+
+
+def test_calculate_fantasy_points_default_ppr():
+    stats = {
+        "receptions": 5,
+        "receiving_yards": 80,
+        "receiving_tds": 1,
+    }
+    points = calculate_fantasy_points(stats)
+    # 5 * 1.0 + 80 * 0.1 + 1 * 6.0 = 5 + 8 + 6 = 19.0
+    assert points == 19.0
+
+
+def test_calculate_fantasy_points_custom_scoring():
+    stats = {"receptions": 5, "receiving_yards": 80}
+    custom = {"rec": 0.5, "rec_yd": 0.1}  # half-PPR
+    points = calculate_fantasy_points(stats, scoring_settings=custom)
+    # 5 * 0.5 + 80 * 0.1 = 2.5 + 8 = 10.5
+    assert points == 10.5
+
+
+def test_flex_adjustment_applied_to_eligible():
+    points = apply_flex_adjustment(10.0, "RB", num_flex_slots=2)
+    assert points > 10.0  # should get scarcity bonus
+
+
+def test_flex_adjustment_not_applied_to_qb():
+    points = apply_flex_adjustment(10.0, "QB", num_flex_slots=2)
+    assert points == 10.0  # QB not flex-eligible
+
+
+def test_flex_adjustment_not_applied_single_flex():
+    points = apply_flex_adjustment(10.0, "RB", num_flex_slots=1)
+    assert points == 10.0  # standard league, no bonus
+
+
+def test_count_flex_slots():
+    roster = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX", "K", "DEF"]
+    assert count_flex_slots(roster) == 2
+
+
+def test_scoring_alias_interceptions_and_fumbles():
+    # Audit C1: nflverse keys passing_interceptions/fumbles_lost_total must score
+    assert calculate_fantasy_points({"passing_interceptions": 1}, DEFAULT_SCORING) == -1.0
+    assert calculate_fantasy_points({"fumbles_lost_total": 1}, DEFAULT_SCORING) == -2.0
+    assert calculate_fantasy_points({"interceptions": 1}, DEFAULT_SCORING) == -1.0
+    assert calculate_fantasy_points({"fumbles_lost": 1}, DEFAULT_SCORING) == -2.0
+    # Combined
+    stats = {"passing_yards": 250, "passing_tds": 1, "passing_interceptions": 1, "fumbles_lost_total": 1}
+    # 250*0.04=10 +5 -1 -2 =12
+    assert calculate_fantasy_points(stats, DEFAULT_SCORING) == 12.0
+
+
+def test_scoring_short_sleeper_keys():
+    # Short Sleeper keys (rec, rec_yd, pass_yd, etc.) must score identically
+    # to long keys — stat_projector and hub emit short keys.
+    assert calculate_fantasy_points({"rec": 5}, DEFAULT_SCORING) == 5.0
+    assert calculate_fantasy_points({"rec_yd": 100}, DEFAULT_SCORING) == 10.0
+    assert calculate_fantasy_points({"rush_yd": 80}, DEFAULT_SCORING) == 8.0
+    assert calculate_fantasy_points({"pass_yd": 300}, DEFAULT_SCORING) == 12.0
+    assert calculate_fantasy_points({"pass_td": 2}, DEFAULT_SCORING) == 10.0
+    assert calculate_fantasy_points({"rush_td": 1}, DEFAULT_SCORING) == 6.0
+    assert calculate_fantasy_points({"rec_td": 1}, DEFAULT_SCORING) == 6.0
+    assert calculate_fantasy_points({"pass_int": 1}, DEFAULT_SCORING) == -1.0
+    assert calculate_fantasy_points({"fum_lost": 1}, DEFAULT_SCORING) == -2.0
+    # Mixed long + short
+    stats = {"pass_yd": 250, "pass_td": 1, "rec": 5, "rec_yd": 80, "rec_td": 1}
+    # 250*0.04=10 +5 +5 +8 +6 =34
+    assert calculate_fantasy_points(stats, DEFAULT_SCORING) == 34.0
+
+
+def test_scoring_nan_guard():
+    assert calculate_fantasy_points({"passing_yards": float("nan")}, DEFAULT_SCORING) == 0.0
+    assert calculate_fantasy_points({"receptions": float("inf")}, DEFAULT_SCORING) == 0.0

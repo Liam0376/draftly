@@ -1,0 +1,893 @@
+"""Stat projection engine: predicts future weekly stats from historical
+performance using weighted recency, TD regression, usage trends, Vegas
+implied totals, and weather adjustments.
+
+Backtested method selection (2024-2025, N=10,351 weeks 4-18, true scoring
+via scoring.py DEFAULT_SCORING on Sleeper settings — K fg_* + 40+ bonuses
+included, no longer K-zeroed as in early scratch backtest_final.py):
+  PRODUCTION FREEZE — Final model (stat): MAE=4.563, Corr=0.648,
+  Pairwise=74.1% (n=10,351; K MAE 4.09 not 0.005). Gate all future model
+  comparisons on THESE three, not on any local/val numbers quoted below.
+  Early scratch published 4.163/0.692/77.7% was K-zeroed (old_map ignored
+  fg_* → K MAE 0.001, -0.416 bias) — SUPERSEDED, do not use as gate
+  (K-zero bug deflated MAE by ~0.40 and inflated corr/pairwise).
+  True gap to theoretical expanding-mean floor ~4.4-4.5 is ~0.10-0.15,
+  not 0.5 — remaining variance is weekly noise.
+
+  Sample/blend + weather scope (guards only — no value/weight change):
+  - <3 games: blend current avg with prior-season REG avg (blend=n/3);
+    empty history + no prior REG rows → 0.0 with is_empty_projection=True
+    flag (injury/rookie unknown made explicit, not silent).
+  - Wind >15mph: QB/WR/TE/K passing/receiving/kicking only — RB excluded
+    (rushing volume less wind-sensitive; no wind factor applied to RB).
+  - Cold <32F: QB/WR/TE passing/receiving only — RB/K excluded
+    (K cold sample too thin, RB cold negligible; no cold factor for RB/K).
+
+  Factors included (each backtested individually on true scoring):
+  - Weighted recent (last 5 games at 2x): corr +0.002 vs simple avg
+  - TD regression to position mean (30%): corr +0.002, bias improvement
+  - Usage trend (15% weight on 3-game trend): corr +0.002
+  - Vegas implied total (TD 50% damped, yards 25%): corr +0.0013, bias -0.126→-0.081
+  - Weather (wind >15mph, cold <32F): corr +0.0004
+
+  Factors tested and REJECTED (honest OOS val 2025, true scoring):
+  - Opponent defense factors: hurt correlation (0.690→0.687) even with
+    multi-season shrinkage. Defense rankings don't persist year-to-year
+    (Spearman rho=0.05-0.34). Signal doesn't exist at this granularity.
+  - EWMA: weighted-recent outperforms on all metrics
+  - Home/away: <0.1% impact on any metric
+  - Full Vegas scaling (all stats equally): hurts MAE (4.16→4.24 in K-zeroed
+    scratch; +0.003 worse on true scoring). Scaling yards proportionally overshoots.
+  - Rest days: negligible effect
+  - QB snap-share scaling (2026-09-10, 2025 holdout weeks 4-18, n=5425):
+    REJECTED — evidence: data/ml/backtest_snap_share_results.json
+    (scripts/backtest_snap_share.py). NOTE (docs batch 2026-09-12): the
+    stored artifact runs all-universe arms at n=8049, not the header's
+    2025-holdout paired comparison at n=5425 — sample mismatch, verdict
+    REJECTED stands either way, do not gate on either t alone.
+    Mechanism is causally right
+    (2025 mop-up mean 0.043; takeover 0.82) and directionally positive
+    (MAE -0.028, QB MAE -0.28, bias fixed, pairwise flat), but paired-t
+    overall t=1.66 (p~0.10) and QB-only t=1.66 (p~0.10) — not
+    significant — with overall corr -0.003 (Fisher z=0.33, noise).
+    Same bar that rejected the XGB attempts. Display-level demotion
+    (hub relevance ordering) stands as the mitigation. Sequel: re-run
+    the variant comparison on real 2026 weeks (true depth CSV + live
+    outcomes) once n suffices — see validate_2026_coverage.py pattern.
+  - XGBoost point-level with PBP opportunity (2026-08-28, 3-season, 15,956 rows
+    weeks 4-18, 38 cols, TimeSeriesSplit(3), 10,531→5,425): REJECTED — evidence:
+    data/ml/backtest_ml_results.json grid w=1.0 val 4.514 vs w=0.0 true stat
+    4.474 (local val) and 4.563 true combined — fails OOS. (xgb_meta.json
+    val_mae 4.556 is the without-K split, n=4978 — different cut, same
+    verdict.) Without K: 4.556 vs 4.61 local, still
+    fails. Ensemble w=0.40 4.45 >4.474 local → fail OOS (combined 4.448 >4.536
+    would pass but is in-sample 2024 leakage; OOS gate is val only).
+  - xFP pull on receiving yards/receptions (X1, 2026-09-15, pre-registered
+    k=0.15 primary / 0.30 sensitivity): REJECTED — evidence:
+    data/ml/backtest_opportunity_results.json. 2025 holdout weeks 4-18
+    all-universe n=8049: paired-t t=-4.36 (diff -0.0065, significantly
+    WORSE than BASE); 2026 Week 1 n=652: t=+0.99 (n.s., inconsistent
+    direction). Trailing xFP gaps are noise at weekly resolution, or the
+    pull double-counts the usage trend's form capture. The xfp_adjust
+    pipeline param stays (tested, default-off) as the instrument, not a win.
+  - Individualized TD prior (X2, 2026-09-15): SUPERSEDED by the POP
+    control same day — population xFP prior beats individualization both
+    samples (X2-vs-POP paired-t t=-5.05 on 2025, t=-2.65 on 2026wk1, both
+    favoring POP). Trailing individual xFP TD rates are too noisy to beat
+    their own mean: shrink all the way. The td_prior pipeline param stays
+    (tested, default-off) as the instrument, not a win.
+  - QB passing xFP (XQ1/QPOP/QFROZEN, 2026-09-15): SPLIT — XQ1 REJECTED
+    (2025 n.s. t=1.6, 2026 t=2.6: inconsistent, fails the both-samples
+    rule); QPOP/QFROZEN PASS both samples (BASE-QFROZEN paired-t t=14.5
+    diff +0.071 on 2025 n=8049 and t=4.7 diff +0.084 on 2026wk1 n=81,
+    corr IMPROVED both, z=-0.41/-0.18; frozen 0.83 reproduces live QPOP
+    within noise). Evidence: data/ml/backtest_opportunity_results.json.
+    SHIPPED 2026-09-15 (blanket points approval): QB passing_tds 1.7 ->
+    0.83, rushing untouched; pinning test + bit-identical proof (only QB
+    rows move) in the commit.
+  - Population xFP TD priors (POP/FROZEN, 2026-09-15): SHIPPED to
+    POS_TD_MEANS (RB rush 0.20/rec 0.04, WR rec 0.18/rush 0.005, TE rec
+    0.14; QB/K untouched — X2/POP never applied there, no evidence).
+    Evidence: data/ml/backtest_opportunity_results.json — BASE-FROZEN
+    paired-t t=42.4 (diff +0.099) on 2025 holdout n=8049 and t=16.1
+    (diff +0.124) on 2026wk1 n=652, corr neutral both, bias improved;
+    FROZEN reproduces live-POP within noise (parity diff +0.006/+0.003).
+    Weight stays 30%, mechanism unchanged — only the prior LEVEL was
+    stale (production means sat far above xFP-implied scoring rates).
+  - Hierarchical TD prior (HIER, 2026-09-15, pre-registered m=5):
+    REJECTED — evidence: data/ml/backtest_opportunity_results.json.
+    Worse than BASE on 2025 (paired-t t=-4.85), noise on 2026wk1 (t=-0.31);
+    vs POP t=-1.95/+0.04. Full trailing windows drive w->1 (approximately
+    X2, already lost); thin-window players are too few to matter.
+    Individual trailing TD rates carry no usable signal beyond the
+    population mean. POP stands.
+  - XGBoost stat-level per-stat (16 boosters 2026-08-28, same 38 cols, real PBP):
+    REJECTED — evidence: data/models/stat_level/meta.json val 4.463 vs true
+    stat 4.474 local (+0.011 win) but corr 0.658 vs 0.6918 (stale K-zeroed
+    baseline; vs true freeze 0.648 it wins locally) and absolute 4.463 vs
+    true 4.563? Actually local win +0.011 but combined 4.307 vs true 4.536 win
+    +0.229 is in-sample 2024 overfit (gap 0.316). Per-stat: only receiving_tds
+    (-0.011), rushing_tds (-0.002), passing_tds (-0.001) beat; yards/receptions
+    +0.36-0.62 worse. With honest local gate (must beat all three on val 2025)
+    it ties on MAE (+0.011) but fails corr/pairwise? Actually vs true local it
+    beats MAE +0.011 and corr +0.015 but pw +0.4 — narrow win, not worth
+    dependency/overfit risk vs 0.10 gap to floor. Keep PBP cache
+    data/nfl_cache/pbp_*.json for research, do not wire into production; stat
+    model remains best mean predictor under $0/local constraints.
+
+  SUPERSEDED local numbers (do not gate — different n/split/scoring;
+  production gate is the 4.563/0.648/74.1% freeze above):
+  - NOTE (docs batch 2026-09-12): stored combined artifacts recompute
+    n=10706, stat mae 4.536 — 355 rows above the freeze n=10351.
+    Unexplained delta; freeze stands until reconciled, never retune here.
+  - Local val 2025-only true scoring: stat 4.474, XGB point 4.514,
+    stat-level 4.463, ensemble w=0.40 (val-tuned, leaky) 4.45.
+  - Combined 2024-2025 in-sample (includes train): ensemble 4.448 vs stat
+    4.536, stat-level 4.307 vs stat 4.536 — in-sample 2024 leakage;
+    honest OOS gate is val/holdout only (see scripts/backtest_ml.py,
+    scripts/backtest_stat_level.py nested protocol).
+
+  Empirical coverage 2025 holdout (measured, widths frozen — do NOT retune):
+  - Method: honest OOS, calibration residuals from 2024 train (n=5281,
+    weeks 4-18, true scoring), evaluated once on 2025 holdout (n=5425,
+    weeks 4-18) via conformal.empirical_coverage(); source
+    data/ml/val_2025.jsonl derived from data/nfl_cache/ (cache exists,
+    never /private/tmp scratch path); full holdout, no subsampling.
+    Evidence: data/models/coverage_2025.json (base qhat width 7.43).
+  - Raw (single qhat width, no scaling): overall 80.5% (target 80%;
+    QB 58.1%, K 86.1%, WR 81.8%, TE 87.2%, RB 80.5%).
+  - Displayed (projection.py heuristic pos_factor*point_factor, clamped
+    3-14, per-row): overall 82.1% (QB 79.0%, K 58.6%, WR 86.0%,
+    TE 83.6%, RB 84.0%). Raw QB undercovers (fat tails); displayed QB
+    improves via 1.45x but K undercovers via 0.55x narrow factor.
+    Widths frozen for display stability — measure only.
+  - v2 (2026-09-15): rebuilt 2025 holdout true-OOS at candidate factors
+    (n=5239 pairs, reproduces v1 baseline within noise: QB 0.7885, K 0.5923).
+    Shipped QB 1.45->1.55 (coverage 0.8154), K 0.55->0.85 (0.7882),
+    overall 0.8420. See projection.py INTERVAL_FACTORS_VERSION=2.
+
+  Statistician-audit finding (2026-09-10): the number above, however
+  honestly it was derived (residuals fit on 2024, evaluated once on
+  2025), is still a calibration-and-test pair drawn from seasons that
+  were both already over by the time it was measured. It says nothing
+  about whether POS_RESIDUALS still holds on data that didn't exist yet
+  when frozen. scripts/validate_2026_coverage.py closes that gap: same
+  production project_player_stats/compute_conformal_bounds, run on real
+  2026 games as they're actually played — genuinely never seen during
+  the 2024/2025 calibration. First result (data/models/
+  coverage_2026_live.json, week 1 only, n=16 — SMALL, not conclusive):
+  overall 81.25% (close to the 2025 number), but QB 33% (n=3) — same
+  undercoverage direction the 2025 holdout already flagged, just noisier
+  at this sample size. Re-run as more 2026 weeks complete; n=16 is a
+  start, not a verdict."""
+
+import math
+from collections import defaultdict
+from typing import Dict, List, Optional
+
+
+QB_STATS = [
+    "passing_yards", "passing_tds", "passing_interceptions",
+    "rushing_yards", "rushing_tds", "fumbles_lost_total",
+]
+SKILL_STATS = [
+    "carries", "rushing_yards", "rushing_tds", "receiving_yards", "receiving_tds",
+    "receptions", "fumbles_lost_total",
+]
+KICKER_STATS = [
+    "fg_made_0_19", "fg_made_20_29", "fg_made_30_39",
+    "fg_made_40_49", "fg_made_50_59", "fg_missed", "pat_made",
+]
+
+VOLUME_STATS = {
+    "rushing_yards", "receiving_yards", "receptions", "passing_yards",
+}
+TD_STATS = {
+    "passing_tds", "rushing_tds", "receiving_tds",
+}
+
+MIN_GAMES_FOR_SEASON = 3
+RECENT_N = 5
+RECENT_WEIGHT = 2.0
+TD_REGRESSION_WEIGHT = 0.30
+USAGE_TREND_WEIGHT = 0.15
+
+# Vegas scaling: damped to avoid overshoot
+VEGAS_TD_DAMPING = 0.50    # 50% of raw implied-total scale for TDs
+VEGAS_YARD_DAMPING = 0.25  # 25% for yardage stats
+LEAGUE_AVG_IMPLIED_TOTAL = 22.2  # mean team implied total (2023-2025)
+
+# Weather thresholds
+WIND_THRESHOLD_MPH = 15
+WIND_PENALTY_PER_MPH = 0.015  # 1.5% per mph over threshold
+COLD_THRESHOLD_F = 32
+COLD_PENALTY_PER_DEGREE = 0.003  # 0.3% per degree below freezing
+
+# xFP-pull cap (opportunity spec): additive pull capped at ±50% of base —
+# same anti-blowup discipline as the usage-trend ±50% cap. No pull from a
+# zero base (mirrors the usage trend's season_avg > 0 guard): a player
+# averaging nothing gets nothing invented for them.
+XFP_PULL_CAP = 0.50
+
+# Floor/ceiling = empirical P20/P80 of actual points, conditional on the
+# projection, per position: (bin mean projection, P20, P80). Fit by
+# scripts/fit_intervals.py on production walk-forward 2024-2025 wk 4-18.
+# Replaced a flat per-position +/-~10 band (hand-typed POS_RESIDUALS) that
+# gave a 1.5-pt WR [0, 11.7] and every WR the same span regardless of role.
+# Holdout (fit 2024, eval 2025, target 0.60 in-range / 0.20 below floor):
+# QB 0.563/0.248, RB 0.645/0.144, WR 0.656/0.159, TE 0.689/0.138,
+# K 0.631/0.164. Mean span WR 16.2 -> 8.6, RB 15.7 -> 8.3, QB 19.9 -> 14.9.
+INTERVAL_TABLE = {
+    "QB": [(4.2, 0.0, 14.0), (11.0, 3.2, 22.2), (14.7, 8.8, 24.7), (17.1, 10.1, 24.1), (19.5, 11.0, 28.9), (23.4, 14.2, 29.8)],
+    "RB": [(0.7, 0.0, 1.4), (1.9, 0.0, 4.2), (3.4, 0.4, 7.0), (5.1, 1.1, 9.4), (7.2, 2.3, 12.5), (10.1, 4.3, 15.9), (13.5, 7.4, 20.2), (18.8, 9.9, 25.0)],
+    "WR": [(0.6, 0.0, 2.0), (2.0, 0.0, 4.2), (3.5, 0.0, 7.4), (5.1, 1.0, 8.6), (7.0, 1.7, 10.8), (9.3, 3.1, 15.6), (12.1, 5.1, 18.9), (17.0, 7.8, 21.8)],
+    "TE": [(0.8, 0.0, 2.4), (2.0, 0.0, 4.1), (3.2, 0.0, 6.1), (4.5, 1.3, 7.1), (6.3, 2.4, 10.8), (8.6, 3.7, 14.4), (12.6, 4.8, 18.7)],
+    "K": [(5.8, 4.0, 12.0), (7.6, 4.0, 12.0), (8.7, 4.0, 12.0), (10.7, 4.0, 13.0)],
+}
+
+
+def interval_bounds(point: float, position: str, table: Optional[Dict] = None) -> tuple:
+    """(floor, ceiling) for a projection: linear interp between bin centers,
+    constant offset from the projection past either end."""
+    t = (table or INTERVAL_TABLE)
+    pts = t.get((position or "").upper()) or t["WR"]
+    if point <= pts[0][0]:
+        c, lo, hi = pts[0]
+    elif point >= pts[-1][0]:
+        c, lo, hi = pts[-1]
+    else:
+        for (c0, lo0, hi0), (c1, lo1, hi1) in zip(pts, pts[1:]):
+            if point <= c1:
+                f = (point - c0) / (c1 - c0)
+                c, lo, hi = point, lo0 + f * (lo1 - lo0), hi0 + f * (hi1 - hi0)
+                break
+    low = max(0.0, min(point, point - (c - lo)))
+    high = max(point, point + (hi - c))
+    return low, high
+
+
+def compute_conformal_bounds(point_estimate: float, position: str) -> Dict[str, float]:
+    """Floor/ceiling for a projected score (see INTERVAL_TABLE). Asymmetric:
+    width is HALF the span, (upper - lower) / 2, kept for consumers that
+    treat it as a spread scale. Use lower/upper for the actual range."""
+    low, high = interval_bounds(point_estimate, position)
+    width = (high - low) / 2
+
+    conf = "HIGH" if width < 4.0 else ("MED" if width < 7.0 else "WIDE")
+
+    return {
+        "point_estimate": round(point_estimate, 2),
+        "lower_bound": round(low, 2),
+        "upper_bound": round(high, 2),
+        "projection_lower": round(low, 2),
+        "projection_upper": round(high, 2),
+        "width": round(width, 2),
+        "projection_width": round(width, 2),
+        "confidence": conf,
+    }
+# Position TD priors (per-game rates). RB/WR/TE recalibrated 2026-09-15
+# to 2024-2025 trailing-xFP means (opportunity follow-up: the POP control
+# beat both the old flat means and individualized priors on the 2025
+# holdout and 2026 Week 1; FROZEN constants reproduced POP within noise).
+# QB passing_tds recalibrated same day (1.7 -> 0.83, qb-xfp follow-up:
+# QFROZEN passed both samples with improved corr; frozen reproduces live
+# QPOP within noise). Weight unchanged (30%) — only prior LEVELS were
+# stale. QB rushing + K untouched (no evidence either way).
+POS_TD_MEANS = {
+    "QB": {"passing_tds": 0.83, "rushing_tds": 0.15},
+    "RB": {"rushing_tds": 0.20, "receiving_tds": 0.04},
+    "WR": {"receiving_tds": 0.18, "rushing_tds": 0.005},
+    "TE": {"receiving_tds": 0.14},
+    "K": {},
+}
+
+PASSING_RECEIVING_STATS = {
+    "passing_yards", "passing_tds", "passing_interceptions",
+    "receiving_yards", "receiving_tds", "receptions",
+}
+
+KICKING_STATS = {
+    "fg_made_0_19", "fg_made_20_29", "fg_made_30_39",
+    "fg_made_40_49", "fg_made_50_59", "fg_made_60_", "fg_missed", "pat_made", "pat_missed",
+}
+
+
+def _get_projection_stats(position: str) -> list:
+    if position == "QB":
+        return QB_STATS
+    elif position == "K":
+        return KICKER_STATS
+    return SKILL_STATS
+
+
+def weighted_recent_avg(
+    values: List[float],
+    recent_n: int = RECENT_N,
+    recent_weight: float = RECENT_WEIGHT,
+) -> float:
+    """Average with last N values weighted more heavily."""
+    if not values:
+        return 0.0
+    if len(values) <= recent_n:
+        return sum(values) / len(values)
+    old = values[:-recent_n]
+    recent = values[-recent_n:]
+    total_weight = len(old) + len(recent) * recent_weight
+    return (sum(old) + sum(recent) * recent_weight) / total_weight
+
+
+def _td_regression(base: float, position: str, stat_key: str,
+                   prior_override: float | None = None) -> float:
+    """Regress TD projections 30% toward position mean.
+
+    prior_override replaces the population mean with a player-specific
+    prior (trailing xFP-implied TD rate) at the same weight — empirical
+    Bayes shape: individual prior vs population prior, weight unchanged.
+    None preserves legacy behavior exactly.
+    """
+    td_means = POS_TD_MEANS.get(position, {})
+    if stat_key in td_means:
+        prior = td_means[stat_key] if prior_override is None else prior_override
+        return base * (1 - TD_REGRESSION_WEIGHT) + prior * TD_REGRESSION_WEIGHT
+    return base
+
+
+def _usage_trend_adjustment(
+    base: float,
+    history: List[Dict],
+    stat_key: str,
+) -> float:
+    """Adjust volume stats based on recent 3-game trend vs prior average.
+
+    Trend is recent_3 vs *prior* average (excluding recent) to avoid dilution
+    where recent is included in denominator (audit I5: 3/n dampening).
+    Requires ≥3 prior games and caps trend to ±50% to avoid small-sample blowup
+    (e.g., Willis 6yd → 138yd = 22× → 4.3× base, audit 2026-09-01).
+    Also filters mop-up games (<5 att for QB) via history length check.
+    """
+    if stat_key not in VOLUME_STATS or len(history) < 4:
+        return base
+
+    prior_vals = [g.get(stat_key, 0) or 0 for g in history[:-3]]
+    # Require 3 prior games for stable denominator; otherwise no trend (avoid Willis 1-game 6yd base)
+    if len(prior_vals) < 3:
+        return base
+    recent_3 = [g.get(stat_key, 0) or 0 for g in history[-3:]]
+    recent_avg = sum(recent_3) / 3
+    season_avg = sum(prior_vals) / len(prior_vals)
+
+    if season_avg > 0:
+        trend = (recent_avg / season_avg) - 1.0
+        # Cap ±50% to prevent 22× blowup on small sample
+        trend = max(-0.5, min(0.5, trend))
+        return base * (1 + trend * USAGE_TREND_WEIGHT)
+    return base
+
+
+def _vegas_adjustment(
+    projected: Dict[str, float],
+    implied_total: float,
+) -> Dict[str, float]:
+    """Scale projections by Vegas implied team total.
+
+    TDs get 50% damped scaling (TDs correlate with game script).
+    Yardage gets 25% (weaker relationship — yards don't scale
+    linearly with team scoring)."""
+    if not implied_total or implied_total <= 0:
+        return projected
+
+    raw_scale = implied_total / LEAGUE_AVG_IMPLIED_TOTAL
+    td_scale = 1.0 + (raw_scale - 1.0) * VEGAS_TD_DAMPING
+    yd_scale = 1.0 + (raw_scale - 1.0) * VEGAS_YARD_DAMPING
+
+    adjusted = {}
+    for stat, val in projected.items():
+        if stat in TD_STATS:
+            adjusted[stat] = val * td_scale
+        elif stat in VOLUME_STATS:
+            adjusted[stat] = val * yd_scale
+        else:
+            adjusted[stat] = val
+    return adjusted
+
+
+def _weather_adjustment(
+    projected: Dict[str, float],
+    position: str,
+    wind_mph: float = 0,
+    temp_f: float = None,
+) -> Dict[str, float]:
+    """Penalize passing/receiving stats in high wind or extreme cold.
+
+    Wind >15mph: 1.5% penalty per mph for passing/receiving/kicking.
+    Cold <32F: 0.3% penalty per degree for passing/receiving."""
+    adjusted = dict(projected)
+
+    if wind_mph > WIND_THRESHOLD_MPH and position in ("QB", "WR", "TE", "K"):
+        wind_factor = max(
+            1.0 - (wind_mph - WIND_THRESHOLD_MPH) * WIND_PENALTY_PER_MPH,
+            0.75,
+        )
+        for stat in adjusted:
+            if stat in PASSING_RECEIVING_STATS:
+                adjusted[stat] *= wind_factor
+            elif position == "K" and stat in KICKING_STATS:
+                # K wind directly penalizes FG/XP (audit F5: K wind was no-op)
+                adjusted[stat] *= wind_factor
+
+    if temp_f is not None and temp_f < COLD_THRESHOLD_F and position in ("QB", "WR", "TE"):
+        cold_factor = max(
+            1.0 - (COLD_THRESHOLD_F - temp_f) * COLD_PENALTY_PER_DEGREE,
+            0.90,
+        )
+        for stat in adjusted:
+            if stat in PASSING_RECEIVING_STATS:
+                adjusted[stat] *= cold_factor
+
+    return adjusted
+
+
+def project_player_stats(
+    player_history: List[Dict],
+    position: str,
+    prior_season_stats: Optional[List[Dict]] = None,
+    implied_total: float = 0,
+    wind_mph: float = 0,
+    temp_f: float = None,
+    is_out: bool = False,
+    xfp_adjust: Optional[Dict[str, float]] = None,
+    td_prior: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """Project a player's stats for an upcoming game.
+
+    Pipeline: weighted-recent avg → xFP pull (optional, default off) →
+    TD regression → usage trend →
+    Vegas implied total → weather adjustment → out-zeroing.
+
+    Args:
+        player_history: game logs this season, ordered by week
+        position: QB/RB/WR/TE/K
+        prior_season_stats: previous season's game logs (optional)
+        implied_total: Vegas implied team total (0 = skip)
+        wind_mph: game wind speed
+        temp_f: game temperature in Fahrenheit (None = dome/unknown)
+        is_out: confirmed Out (Out/IR/PUP/...) — zero all counting stats.
+            An Out player scores ~0 by definition; without this, 17 games
+            of prior starter history drown one injury week (live 2026-09:
+            Darnold projected 163 yds while Out). Season/ROS callers must
+            NOT pass this (a 1-week Out must not nuke season value) —
+            enforced by call-site, not here.
+        xfp_adjust: {stat_key: additive delta} applied to the base
+            immediately after the recent-average/blend, BEFORE TD regression
+            and usage trend, so every downstream step composes exactly as
+            with unadjusted bases. Intended for trailing xFP gaps
+            (k * (expected - actual)); capped at +-XFP_PULL_CAP of |base|,
+            no pull from a zero base. None/empty = off (legacy exact).
+        td_prior: {td_stat_key: individualized prior} replacing the
+            position mean inside _td_regression at the same 30% weight.
+            None/empty = off (legacy exact).
+    """
+    stat_keys = _get_projection_stats(position)
+    projected = {}
+
+    for stat_key in stat_keys:
+        values = [g.get(stat_key, 0) or 0 for g in player_history]
+
+        if len(values) >= MIN_GAMES_FOR_SEASON:
+            base = weighted_recent_avg(values)
+        elif values and prior_season_stats:
+            prior_vals = [
+                g.get(stat_key, 0) or 0
+                for g in prior_season_stats
+                if g.get("season_type", "REG") == "REG"
+            ]
+            if prior_vals:
+                current_avg = sum(values) / len(values)
+                prior_avg = sum(prior_vals) / len(prior_vals)
+                blend = len(values) / MIN_GAMES_FOR_SEASON
+                base = blend * current_avg + (1 - blend) * prior_avg
+            else:
+                base = sum(values) / len(values)
+        elif values:
+            base = sum(values) / len(values)
+        elif prior_season_stats:
+            prior_vals = [
+                g.get(stat_key, 0) or 0
+                for g in prior_season_stats
+                if g.get("season_type", "REG") == "REG"
+            ]
+            if prior_vals:
+                base = sum(prior_vals) / len(prior_vals)
+            else:
+                base = 0.0
+        else:
+            base = 0.0
+
+        if xfp_adjust and stat_key in xfp_adjust and base != 0:
+            try:
+                delta = float(xfp_adjust[stat_key] or 0)
+            except Exception:
+                delta = 0.0
+            cap = abs(base) * XFP_PULL_CAP
+            base = base + max(-cap, min(cap, delta))
+        base = _td_regression(base, position, stat_key,
+                              prior_override=(td_prior or {}).get(stat_key))
+        base = _usage_trend_adjustment(base, player_history, stat_key)
+        projected[stat_key] = base
+
+    projected = _vegas_adjustment(projected, implied_total)
+    projected = _weather_adjustment(projected, position, wind_mph, temp_f)
+
+    # Out-zeroing (backtested, not guessed — see header): confirmed Outs
+    # score ~0; projecting their prior-starter average is pure staleness.
+    # Flags untouched (Out is known, not unknown); season callers never
+    # pass is_out (see build_weekly_projections neutral path).
+    if is_out:
+        for k, v in projected.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                projected[k] = 0.0
+
+    # Empty-projection guard (docs/flag only — no value change):
+    # empty history + no prior REG rows falls through to 0.0 above
+    # (injury/rookie unknown). Flag explicitly so callers can distinguish
+    # unknown from true zero. Tested and REJECTED imputing positional mean
+    # here — evidence: adds bias on OOS rookies; explicit zero + flag is honest.
+    if not player_history:
+        _has_prior_reg = bool(
+            prior_season_stats
+            and any(
+                g.get("season_type", "REG") == "REG" for g in prior_season_stats
+            )
+        )
+        projected["is_empty_projection"] = not _has_prior_reg
+    else:
+        projected["is_empty_projection"] = False
+
+    return projected
+
+
+def build_game_context(schedule: List[Dict]) -> Dict:
+    """Build lookup from schedule: (team, week) → game context.
+
+    Returns dict mapping (team_abbr, week_num) to:
+        implied_total, wind, temp, is_dome, opponent, is_home
+
+    Lookahead quirk (documented, no value change): schedule temp/wind are
+    OBSERVED post-game values from nflverse/schedule cache, not pre-game
+    forecasts. Backtests using observed weather overstate live accuracy
+    slightly (live must use Open-Meteo forecast via weather adapter);
+    measured impact is small (weather corr +0.0004) so production keeps
+    observed for backtest comparability. Do not treat as forecast.
+    """
+    ctx = {}
+    for g in schedule:
+        week = g.get("week")
+        if g.get("game_type") != "REG" or not week:
+            continue
+
+        home = g.get("home_team", "")
+        away = g.get("away_team", "")
+        # Audit I3: nflreadpy spread_line sign = home spread (home favored +). Guard string/NaN.
+        # Use _safe_float pattern (mirror ml/features.py:199) and document contract.
+        def _sf(v):
+            try:
+                if v is None or v == "":
+                    return 0.0
+                fv = float(str(v).strip())
+                if fv != fv:  # NaN
+                    return 0.0
+                if fv == float("inf") or fv == float("-inf"):
+                    return 0.0
+                return fv
+            except Exception:
+                return 0.0
+        total_line = _sf(g.get("total_line"))
+        spread = _sf(g.get("spread_line"))  # home - away per nflreadpy schedule_2025.json sample PHI 8.5 home
+        temp = g.get("temp")
+        # temp may be string or NaN; keep None for dome, else _sf or None
+        try:
+            if temp is not None and temp != "":
+                tf = float(temp)
+                if tf != tf or tf == float("inf") or tf == float("-inf"):
+                    temp = None
+                else:
+                    temp = tf
+            else:
+                temp = None
+        except Exception:
+            temp = None
+        wind_raw = g.get("wind")
+        try:
+            wind = float(wind_raw) if wind_raw is not None and wind_raw != "" else 0.0
+            if wind != wind or wind == float("inf") or wind == float("-inf"):
+                wind = 0.0
+        except Exception:
+            wind = 0.0
+        roof = g.get("roof", "")
+        is_dome = roof in ("dome", "closed")
+
+        if total_line > 0:
+            home_implied = (total_line + spread) / 2
+            away_implied = (total_line - spread) / 2
+        else:
+            home_implied = 0
+            away_implied = 0
+
+        base_ctx = {
+            "temp": 72 if is_dome else temp,
+            "wind": 0 if is_dome else wind,
+            "is_dome": is_dome,
+        }
+
+        if home:
+            ctx[(home, week)] = {
+                **base_ctx,
+                "implied_total": home_implied,
+                "opponent": away,
+                "is_home": True,
+            }
+        if away:
+            ctx[(away, week)] = {
+                **base_ctx,
+                "implied_total": away_implied,
+                "opponent": home,
+                "is_home": False,
+            }
+
+    return ctx
+
+
+def blend_with_market(
+    model_pts: Optional[float],
+    market_pts: Optional[float],
+    position: str,
+    w_model: Optional[float] = None,
+) -> Optional[float]:
+    """Weekly point blend: w_model*model + (1-w_model)*market.
+
+    Evidence + rollout: docs/superpowers/specs/2026-09-23-market-blend-spec.md
+    (shadow-only while config.MARKET_BLEND_ENABLED is False).
+
+    Falls back to model_pts unchanged when:
+    - position not in MARKET_BLEND_POSITIONS (K: no market in scope);
+    - market missing or <= 0 (no Sleeper row / Sleeper projects a DNP);
+    - model_pts <= 0. This keeps out-zero absolute (a confirmed Out must
+      score 0, not 0.75*market). Known ceiling: a 0-history rookie also
+      stays at 0 and misses the market's view; the backtest scope never
+      contained those rows, so no evidence either way yet.
+    """
+    from ffanalytics.config import MARKET_BLEND_POSITIONS, MARKET_BLEND_W_MODEL
+
+    if w_model is None:
+        w_model = MARKET_BLEND_W_MODEL
+    if (model_pts is None or (position or "").upper() not in MARKET_BLEND_POSITIONS
+            or market_pts is None or market_pts <= 0 or model_pts <= 0):
+        return model_pts
+    return w_model * float(model_pts) + (1.0 - w_model) * float(market_pts)
+
+
+def build_weekly_projections(
+    season_stats: List[Dict],
+    schedule: List[Dict],
+    target_week: int,
+    scoring_settings: Dict,
+    prior_season_stats: Optional[List[Dict]] = None,
+    out_pids: Optional[set] = None,
+) -> List[Dict]:
+    """Build projections for all players for a target week.
+
+    Uses only data from weeks prior to target_week (true out-of-sample).
+    Incorporates Vegas lines and weather from schedule data.
+    out_pids (optional set of model player_ids): confirmed Outs get
+    zeroed WEEKLY stats. Never applied to the neutral season path below
+    (a 1-week Out must not nuke season/ROS value) — enforced by only
+    passing is_out at the weekly call site.
+    """
+    reg = [s for s in season_stats if s.get("season_type") == "REG"]
+    # Cross-season guard (audit C2): when data season != schedule season (preseason),
+    # week filter would truncate 17-game history to <target_week games. Bypass in that case.
+    try:
+        stats_seasons = {s.get("season") for s in season_stats if s.get("season") is not None}
+        sched_seasons = {g.get("season") for g in schedule if g.get("season") is not None}
+        cross_season = bool(stats_seasons and sched_seasons and stats_seasons.isdisjoint(sched_seasons))
+    except Exception:
+        cross_season = False
+    if cross_season:
+        prior_data = reg
+    else:
+        filtered_prior = [s for s in reg if s.get("week", 0) < target_week]
+        # why fail-closed (no `else reg` fallback): when seasons match, an
+        # empty filter means "no history before target" (e.g. same-season
+        # target_week=1) — falling back to full reg would silently use weeks
+        # >= target as history (future leak).
+        #
+        # why prior_season_stats fallback here too (user-caught live bug,
+        # 2026-09-10): this used to be unreachable — stats_season stayed
+        # clamped a year behind the schedule season until real games
+        # published, so week 1 always hit the cross_season branch above for
+        # free. Once stats_season caught up to a live season (so /props/
+        # board's "actual" stat stops being last year's box score), week 1
+        # (or any week with zero same-season history yet — a fresh season's
+        # early weeks) lands here with `filtered_prior` empty and NO prior
+        # season data to fall back to, producing zero projections
+        # league-wide (silent, no crash — just nothing). Same shape as the
+        # cross_season branch: treat the real prior season as this week's
+        # history when there's no same-season history yet.
+        if not filtered_prior and prior_season_stats:
+            prior_data = [
+                s for s in prior_season_stats if s.get("season_type", "REG") == "REG"
+            ]
+        else:
+            prior_data = filtered_prior
+
+    game_ctx = build_game_context(schedule)
+
+    player_games = defaultdict(list)
+    player_info = {}
+    for s in prior_data:
+        pid = s.get("player_id", "")
+        if not pid:
+            continue
+        pos = s.get("position", "")
+        if pos not in ("QB", "RB", "WR", "TE", "K"):
+            continue
+        player_games[pid].append(s)
+        player_info[pid] = {
+            "player_id": pid,
+            "player_display_name": s.get("player_display_name", ""),
+            "position": pos,
+            # nflverse quirk: use team NOT recent_team (AGENTS.md) — recent_team is null in cache
+            "team": s.get("team", "") or s.get("recent_team", ""),
+        }
+
+    for pid in player_games:
+        player_games[pid].sort(key=lambda x: x.get("week", 0))
+
+    prior_player_games = defaultdict(list)
+    if prior_season_stats:
+        for s in prior_season_stats:
+            pid = s.get("player_id", "")
+            if pid:
+                prior_player_games[pid].append(s)
+
+    projections = []
+    for pid, info in player_info.items():
+        team = info["team"]
+        # Default implied_total 21.0 provenance (no value change): conservative
+        # fallback slightly below LEAGUE_AVG_IMPLIED_TOTAL 22.2 for missing/BYE
+        # weeks (bowl-season neutral ~21-22); keeps BYE/missing from inflating
+        # season totals. Tested and REJECTED tuning to 22.2 — evidence: no OOS
+        # gain, adds bias on BYE weeks; keep 21.0 frozen.
+        ctx = game_ctx.get((team, target_week)) or {"implied_total": 21.0, "wind": 0, "temp": 70, "opponent": "BYE"}
+
+        history = player_games[pid]
+        position = info["position"]
+
+        projected_stats = project_player_stats(
+            player_history=history,
+            position=position,
+            prior_season_stats=prior_player_games.get(pid),
+            implied_total=ctx.get("implied_total", 0),
+            wind_mph=ctx.get("wind", 0) or 0,
+            temp_f=ctx.get("temp"),
+            is_out=bool(out_pids and pid in out_pids),
+        )
+
+        projected_stats["player_id"] = pid
+        projected_stats["player_display_name"] = info["player_display_name"]
+        projected_stats["position"] = position
+        projected_stats["team"] = team
+        projected_stats["recent_team"] = team
+        projected_stats["opponent_team"] = ctx.get("opponent", "")
+        projected_stats["position_group"] = position.upper()
+        projected_stats["week"] = target_week
+        projected_stats["wind_mph"] = ctx.get("wind", 0)
+
+        # Compute points and conformal bounds
+        from ffanalytics.scoring import calculate_fantasy_points
+        fpts = calculate_fantasy_points(projected_stats, scoring_settings)
+        bounds = compute_conformal_bounds(fpts, position)
+        projected_stats.update(bounds)
+        projected_stats["projected_points"] = bounds["point_estimate"]
+        # Vegas-neutral points for season totals (avoid extrapolating Week-1 shootout to 17 games)
+        neutral_stats = project_player_stats(
+            player_history=history,
+            position=position,
+            prior_season_stats=prior_player_games.get(pid),
+            implied_total=LEAGUE_AVG_IMPLIED_TOTAL,
+            wind_mph=0,
+            temp_f=None,
+        )
+        neutral_fpts = calculate_fantasy_points(neutral_stats, scoring_settings)
+        projected_stats["_neutral_points"] = round(neutral_fpts, 2)
+        projected_stats["_neutral_stats"] = neutral_stats
+
+        projections.append(projected_stats)
+
+    return projections
+
+
+def compute_ros_projections(
+    season_stats: List[Dict],
+    schedule: List[Dict],
+    scoring_settings: Dict,
+    current_week: int,
+    prior_season_stats: Optional[List[Dict]] = None,
+    out_pids: Optional[set] = None,
+) -> List[Dict]:
+    """Compute Rest-of-Season projections by summing independent per-week projections.
+
+    Each remaining week gets its own projection using that week's specific
+    opponent, vegas line, and weather — not a naive ×N multiplier.
+
+    Args:
+        season_stats: full season game logs (used by build_weekly_projections)
+        schedule: full season schedule with vegas/weather
+        scoring_settings: league scoring (passed to build_weekly_projections)
+        current_week: the current NFL week (1-18)
+        prior_season_stats: previous season game logs (optional)
+        out_pids: confirmed Outs (optional)
+
+    Returns:
+        list of dicts sorted by ros_points descending, each with:
+        player_id, player_display_name, position, team,
+        ros_points, remaining_games, and per_week: {week: {points, lower,
+        upper, width, opponent, wind_mph}} — the independent per-week
+        breakdown this function sums into ros_points. Persisted verbatim
+        into the weekly_projections table by refresh.py so hub week
+        pickers (Matchups, Projections) can read a real per-week number
+        instead of a season-average snapshot.
+    """
+    # Accumulate per-player: {pid: {info, total_pts, weeks_played}}
+    totals: Dict[str, dict] = {}
+
+    for wk in range(current_week, 19):
+        week_projs = build_weekly_projections(
+            season_stats=season_stats,
+            schedule=schedule,
+            target_week=wk,
+            scoring_settings=scoring_settings,
+            prior_season_stats=prior_season_stats,
+            out_pids=out_pids,
+        )
+        for p in week_projs:
+            pid = p.get("player_id", "")
+            if not pid:
+                continue
+            is_bye = (p.get("opponent_team") or p.get("opponent") or "") == "BYE"
+            pts = 0.0 if is_bye else float(p.get("projected_points") or 0)
+            if pid not in totals:
+                totals[pid] = {
+                    "player_id": pid,
+                    "player_display_name": p.get("player_display_name", ""),
+                    "position": p.get("position", ""),
+                    "team": p.get("team") or p.get("recent_team") or "",
+                    "ros_points": 0.0,
+                    "per_week": {},
+                    "remaining_games": 0,
+                }
+            # BYE weeks still stored per-week as 0 for hub display, but never
+            # summed into ROS and never counted as a remaining game.
+            if is_bye:
+                totals[pid]["per_week"][wk] = {
+                    "points": 0.0,
+                    "lower": 0.0,
+                    "upper": 0.0,
+                    "width": 0.0,
+                    "opponent": "BYE",
+                    "wind_mph": 0,
+                }
+                continue
+            totals[pid]["ros_points"] += pts
+            totals[pid]["per_week"][wk] = {
+                "points": round(pts, 2),
+                "lower": p.get("lower_bound"),
+                "upper": p.get("upper_bound"),
+                "width": p.get("width"),
+                "opponent": p.get("opponent_team", ""),
+                "wind_mph": p.get("wind_mph", 0),
+            }
+            totals[pid]["remaining_games"] += 1
+
+    result = sorted(totals.values(), key=lambda x: x["ros_points"], reverse=True)
+    return result

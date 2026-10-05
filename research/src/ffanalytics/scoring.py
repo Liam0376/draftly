@@ -1,0 +1,162 @@
+"""League-specific scoring calculator. Applies the actual Sleeper scoring
+settings (fetched by refresh job) instead of hardcoded PPR assumptions."""
+
+# Default scoring mirrors Sleeper "Fantasy Bahamas" (1397736035240173568) as of 2026-08-28.
+# PPR rec=1.0, yardage 0.1/0.04, TD 5/6, plus Sleeper 40+ bonuses at 1.0 (not 2.0 as in early backtests).
+# Full live truth is fetched via sleeper.get_league_settings() — this fallback is only for cold starts/tests.
+DEFAULT_SCORING = {
+    "rec": 1.0, "rec_yd": 0.1, "rush_yd": 0.1, "pass_yd": 0.04,
+    "pass_td": 5.0, "rush_td": 6.0, "rec_td": 6.0, "pass_int": -1.0,
+    "pass_2pt": 2.0, "rush_2pt": 2.0, "rec_2pt": 2.0,
+    # 40+ yard play bonuses (Sleeper = 1.0 each; early backtests used 2.0)
+    "pass_cmp_40p": 1.0, "rush_40p": 1.0, "rec_40p": 1.0,
+    "pass_td_40p": 1.0, "rush_td_40p": 1.0, "rec_td_40p": 1.0,
+    # Kicking / misc (subset of Sleeper — DEF/ST scoring handled separately by Sleeper)
+    "fgm_0_19": 3.0, "fgm_20_29": 3.0, "fgm_30_39": 3.0, "fgm_40_49": 4.0, "fgm_50_59": 5.0, "fgm_60p": 6.0,
+    "fgmiss": -1.0, "fgmiss_0_19": -1.0, "fgmiss_20_29": -1.0,
+    "xpm": 1.0, "xpmiss": -1.0,
+    "fum_lost": -2.0, "fum_rec": 2.0, "fum_rec_td": 6.0, "ff": 1.0,
+}
+
+# 2-flex league scarcity adjustment: RB/WR/TE flex-eligible players are
+# more valuable because more starters compete for them
+FLEX_ELIGIBLE_POSITIONS = {"RB", "WR", "TE"}
+FLEX_SCARCITY_MULTIPLIER = 1.05  # 5% uplift for flex-eligible in 2+ flex leagues
+
+
+def calculate_fantasy_points(stats: dict, scoring_settings: dict | None = None) -> float:
+    """Sum stat_value * scoring_multiplier across all stat keys, with NaN
+    guards. stats keys map 1:1 to Sleeper scoring settings (e.g. rec_yd)."""
+    settings = scoring_settings or DEFAULT_SCORING
+
+    # Normalize nflverse/stat_projector aliases before scoring (audit C1: missing keys)
+    # stat_projector emits passing_interceptions / fumbles_lost_total but legacy keys interceptions/fumbles_lost also occur
+    if "passing_interceptions" in stats and "interceptions" not in stats:
+        stats = {**stats, "interceptions": stats.get("passing_interceptions")}
+    if "fumbles_lost_total" in stats and "fumbles_lost" not in stats:
+        stats = {**stats, "fumbles_lost": stats.get("fumbles_lost_total")}
+
+    stat_to_scoring_key = {
+        # Long nflverse keys → canonical scoring keys
+        "receptions": "rec",
+        "receiving_yards": "rec_yd",
+        "rushing_yards": "rush_yd",
+        "passing_yards": "pass_yd",
+        "passing_tds": "pass_td",
+        "rushing_tds": "rush_td",
+        "receiving_tds": "rec_td",
+        "interceptions": "pass_int",
+        "fumbles_lost": "fum_lost",
+        "passing_2pt": "pass_2pt",
+        "rushing_2pt": "rush_2pt",
+        "receiving_2pt": "rec_2pt",
+        "passing_40": "pass_cmp_40p",
+        "rushing_40": "rush_40p",
+        "receiving_40": "rec_40p",
+        "passing_td_40": "pass_td_40p",
+        "rushing_td_40": "rush_td_40p",
+        "receiving_td_40": "rec_td_40p",
+        "fg_made_0_19": "fgm_0_19",
+        "fg_made_20_29": "fgm_20_29",
+        "fg_made_30_39": "fgm_30_39",
+        "fg_made_40_49": "fgm_40_49",
+        "fg_made_50_59": "fgm_50_59",
+        "fg_made_60_": "fgm_60p",
+        "fg_missed": "fgmiss",
+        "pat_made": "xpm",
+        "pat_missed": "xpmiss",
+        "fumble_recovery": "fum_rec",
+        "fumble_recovery_td": "fum_rec_td",
+        "forced_fumble": "ff",
+        # Short Sleeper keys → canonical scoring keys (stat_projector/hub emit these)
+        "rec": "rec",
+        "rec_yd": "rec_yd",
+        "rush_yd": "rush_yd",
+        "pass_yd": "pass_yd",
+        "pass_td": "pass_td",
+        "rush_td": "rush_td",
+        "rec_td": "rec_td",
+        "pass_int": "pass_int",
+        "fum_lost": "fum_lost",
+        "pass_2pt": "pass_2pt",
+        "rush_2pt": "rush_2pt",
+        "rec_2pt": "rec_2pt",
+        "pass_cmp_40p": "pass_cmp_40p",
+        "rush_40p": "rush_40p",
+        "rec_40p": "rec_40p",
+        "pass_td_40p": "pass_td_40p",
+        "rush_td_40p": "rush_td_40p",
+        "rec_td_40p": "rec_td_40p",
+        "fgm_0_19": "fgm_0_19",
+        "fgm_20_29": "fgm_20_29",
+        "fgm_30_39": "fgm_30_39",
+        "fgm_40_49": "fgm_40_49",
+        "fgm_50_59": "fgm_50_59",
+        "fgm_60p": "fgm_60p",
+        "fgmiss": "fgmiss",
+        "fgmiss_0_19": "fgmiss_0_19",
+        "fgmiss_20_29": "fgmiss_20_29",
+        "xpm": "xpm",
+        "xpmiss": "xpmiss",
+        "fum_rec": "fum_rec",
+        "fum_rec_td": "fum_rec_td",
+        "ff": "ff",
+    }
+
+    points = 0.0
+    for stat_key, scoring_key in stat_to_scoring_key.items():
+        raw = stats.get(stat_key, 0)
+        # Guard NaN (e.g., float('nan') from CSV) — treat as 0 for scoring; audit edge-case 12-15
+        try:
+            if raw is None or (isinstance(raw, float) and raw != raw):  # NaN check
+                raw = 0
+            stat_value = float(raw) if raw else 0
+        except Exception:
+            stat_value = 0
+        multiplier = settings.get(scoring_key, 0)
+        try:
+            if multiplier is None or (isinstance(multiplier, float) and multiplier != multiplier):
+                multiplier = 0
+        except Exception:
+            multiplier = 0
+        # Clamp infinities
+        if stat_value == float("inf") or stat_value == float("-inf"):
+            stat_value = 0
+        points += stat_value * float(multiplier)
+
+    # Final guard: if points is NaN/inf, return 0 rather than propagating
+    if points != points or points == float("inf") or points == float("-inf"):
+        return 0.0
+    return points
+
+
+def score_sleeper_stats(stats: dict, scoring_settings: dict | None = None) -> float:
+    """Score a Sleeper stat line (projection or actual). Sleeper stat keys
+    ARE the scoring-setting keys (pass_yd, rec, rec_40p, ...), so this is a
+    direct dot product with no alias map. Non-numeric/NaN/inf values count 0."""
+    settings = scoring_settings or DEFAULT_SCORING
+    total = 0.0
+    for key, mult in settings.items():
+        try:
+            v, m = float(stats.get(key) or 0), float(mult or 0)
+        except (TypeError, ValueError):
+            continue
+        if v == v and m == m and abs(v) != float("inf") and abs(m) != float("inf"):
+            total += v * m
+    return total
+
+
+def apply_flex_adjustment(points: float, position: str, num_flex_slots: int = 2) -> float:
+    if position in FLEX_ELIGIBLE_POSITIONS and num_flex_slots >= 2:
+        extra_flex = num_flex_slots - 1  # standard is 1 flex
+        adjustment = 1.0 + (FLEX_SCARCITY_MULTIPLIER - 1.0) * extra_flex
+        return points * adjustment
+    return points
+
+
+def count_flex_slots(roster_positions: list[str]) -> int:
+    return sum(1 for pos in roster_positions if pos == "FLEX")
+
+
+# Alias for backwards compat / spec reference: SCORING == DEFAULT_SCORING
+SCORING = DEFAULT_SCORING

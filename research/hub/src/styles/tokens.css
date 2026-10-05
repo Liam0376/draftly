@@ -1,0 +1,399 @@
+/* ═══════════════════════════════════════════════════════
+   Draftly — Design Tokens v2 (Draftly rebrand)
+   Cool canvas · single purple accent · flat hairlines
+   All v4/v2 variable names preserved for compatibility.
+   ═══════════════════════════════════════════════════════ */
+:root {
+  /* Base — cool-gray page canvas (Yahoo grounded) */
+  --bg: #EEF2FB;
+  --bg-rgb: 238, 242, 251;
+  --surface: #FFFFFF;
+  --surface-rgb: 255, 255, 255;
+  --surface-raised: #F8FAFC;
+  --surface-hover: #F5F3FF; /* purple 4% tint */
+  --surface-glass: rgba(255, 255, 255, 0.85);
+  --border: #DEE4F3;
+  --border-strong: #CBD5E1;
+  --border-active: #7D2EFF;
+
+  /* Text */
+  --text: #0F172A;
+  --text-rgb: 15, 23, 42;
+  --text-muted: #475569;
+  --text-faint: #94A3B8;
+  --text-inverse: #FFFFFF;
+
+  /* Typography — Oswald display + Poppins body (Draftly §2) */
+  --font-sans: "Poppins", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, "Segoe UI", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+  --font-display: "Oswald", "Arial Narrow", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, sans-serif;
+
+  /* Draftly identity — single purple accent */
+  --flag: #7D2EFF;
+  --flag-rgb: 125, 46, 255;
+  --flag-ink: #FFFFFF;
+  --field: #7D2EFF;
+  --field-rgb: 125, 46, 255;
+  --paper: #EEF2FB;
+  --ink: #0F172A;
+  --rule: #DEE4F3;
+
+  /* Accent — purple (spec names + legacy aliases) */
+  --accent: #7D2EFF;
+  --accent-hover: #6A20E6;
+  --accent-dim: rgba(125, 46, 255, 0.08);
+  --accent-rgb: 125, 46, 255;
+
+  /* Primary — purple (single accent; green lives in --emerald) */
+  --primary: #7D2EFF;
+  --primary-rgb: 125, 46, 255;
+  --primary-light: #907CFF;
+  --primary-dim: rgba(125, 46, 255, 0.08);
+  --primary-hover: #6A20E6;
+
+  /* Warning tier — golden yellow (orange removed with v1) */
+  --amber: #CA8A04;
+  --amber-rgb: 202, 138, 4;
+  --amber-dim: rgba(202, 138, 4, 0.10);
+  --amber-glow: rgba(202, 138, 4, 0.25);
+  --amber-strong: #A16207;
+
+  /* Semantic */
+  --emerald: #0E7A4F;
+  --emerald-rgb: 14, 122, 79;
+  --emerald-dim: rgba(14, 122, 79, 0.08);
+  --crimson: #C93A2E;
+  --crimson-rgb: 201, 58, 46;
+  --crimson-dim: rgba(201, 58, 46, 0.08);
+  --sky: #2270A8;
+  --sky-rgb: 34, 112, 168;
+  --sky-dim: rgba(34, 112, 168, 0.08);
+  --violet: #6D4FC2;
+  --violet-rgb: 109, 79, 194;
+  --violet-dim: rgba(109, 79, 194, 0.08);
+
+  /* Position hues */
+  --pos-qb: #2270A8;
+  --pos-rb: #0E7A4F;
+  --pos-wr: #C2541F;
+  --pos-te: #6D4FC2;
+  --pos-k: #C2437F;
+  --pos-def: #6B6B64;
+
+  /* Confidence & Weather */
+  --conf-high: #0E7A4F;
+  --conf-medium: #CA8A04;
+  --conf-low: #9B9B93;
+  --weather-ok: #0E7A4F;
+  --weather-warn: #CA8A04;
+  --weather-bad: #C93A2E;
+
+  /* Elevation — none at rest; modal/dropdown only (Yahoo) */
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 4px 16px rgba(15, 23, 42, 0.07);
+  --shadow-lg: 0 16px 48px rgba(15, 23, 42, 0.16);
+  --shadow-xl: 0 16px 48px rgba(15, 23, 42, 0.16);
+  --shadow-glow: 0 0 0 2px rgba(125, 46, 255, 0.35);
+  --shadow-glow-amber: 0 0 0 2px rgba(125, 46, 255, 0.35);
+
+  /* Sidebar — near-black, it works (spec §3) */
+  --sidebar-bg: #0B0B0F;
+  --sidebar-border: rgba(255,255,255,0.07);
+  --sidebar-text: rgba(255,255,255,0.55);
+  --sidebar-bg-hover: rgba(255,255,255,0.06);
+  --sidebar-bg-active: rgba(255,255,255,0.07);
+  --sidebar-text-active: #FFFFFF;
+
+  /* Topbar */
+  --topbar-bg: rgba(255,255,255,0.9);
+  --topbar-border: var(--border);
+  --topbar-height: 58px;
+
+  /* Layout */
+  --color-primary: #7D2EFF;
+  --color-on-primary: #FFFFFF;
+  --color-secondary: #2270A8;
+  --color-accent: #7D2EFF;
+  --grid-gap: 12px;
+  --card-padding: 16px;
+  --font-size-small: 12px;
+  --table-row-height: 40px;
+  --sidebar-width: 232px;
+  --header-height: 52px;
+  --kpi-good: #0E7A4F;
+  --kpi-ok: #CA8A04;
+  --kpi-bad: #C93A2E;
+
+  --mobile-nav-height: 64px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  --team-accent: var(--primary);
+
+  /* Card treatment — 12px cards, hairline, 6px badges */
+  --card-radius: 12px;
+  --card-border: 1px solid var(--border);
+  --card-bg: var(--surface);
+  --badge-radius: 6px;
+
+  /* Visual richness */
+  --sidebar-gradient: linear-gradient(180deg, #0B0B0F 0%, #14141A 100%);
+  --card-accent-width: 3px;
+  --glow-primary: 0 0 0 3px rgba(125,46,255,0.14);
+  --glow-amber: 0 0 0 3px rgba(202,138,4,0.20);
+  --glow-emerald: 0 0 0 3px rgba(14,122,79,0.12);
+  --glow-sky: 0 0 0 3px rgba(34,112,168,0.12);
+  --hero-gradient: none;
+  --surface-gradient: none;
+  --kpi-accent-good: var(--emerald);
+  --kpi-accent-ok: var(--amber);
+  --kpi-accent-bad: var(--crimson);
+
+  --glass-bg: var(--surface);
+  --glass-border: var(--border);
+  --glass-blur: 0px;
+
+  --mesh-1: transparent;
+  --mesh-2: transparent;
+  --mesh-3: transparent;
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Dark Mode — after-hours scoreboard
+   ═══════════════════════════════════════════════════════ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { color-scheme: dark; }
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0E100F;
+    --bg-rgb: 14, 16, 15;
+    --surface: #161918;
+    --surface-rgb: 22, 25, 24;
+    --surface-raised: #1C201E;
+    --surface-hover: #232825;
+    --surface-glass: rgba(22, 25, 24, 0.85);
+    --border: rgba(255,255,255,0.08);
+    --border-strong: rgba(255,255,255,0.14);
+    --border-active: #FF6A45;
+
+    --text: #ECECE7;
+    --text-rgb: 236, 236, 231;
+    --text-muted: #A6A6A0;
+    --text-faint: #6E6E68;
+    --text-inverse: #101312;
+
+    --flag: #FF6A45;
+    --flag-rgb: 255, 106, 69;
+    --flag-ink: #101312;
+    --field: #5BBF84;
+    --field-rgb: 91, 191, 132;
+    --paper: #0E100F;
+    --ink: #ECECE7;
+    --rule: rgba(255,255,255,0.08);
+
+    --primary: #5BBF84;
+    --primary-rgb: 91, 191, 132;
+    --primary-light: #8FD6A4;
+    --primary-dim: rgba(91, 191, 132, 0.10);
+    --primary-hover: #8FD6A4;
+
+    --amber: #FF6A45;
+    --amber-rgb: 255, 106, 69;
+    --amber-dim: rgba(255, 106, 69, 0.12);
+    --amber-glow: rgba(255, 106, 69, 0.30);
+    --amber-strong: #FF8A6B;
+
+    --emerald: #4CC38A;
+    --emerald-rgb: 76, 195, 138;
+    --emerald-dim: rgba(76, 195, 138, 0.12);
+    --crimson: #E0604F;
+    --crimson-rgb: 224, 96, 79;
+    --crimson-dim: rgba(224, 96, 79, 0.12);
+    --sky: #5EA8DC;
+    --sky-rgb: 94, 168, 220;
+    --sky-dim: rgba(94, 168, 220, 0.12);
+    --violet: #A68CF0;
+    --violet-rgb: 166, 140, 240;
+    --violet-dim: rgba(166, 140, 240, 0.12);
+
+    --pos-qb: #5EA8DC;
+    --pos-rb: #4CC38A;
+    --pos-wr: #FF8A5C;
+    --pos-te: #A68CF0;
+    --pos-k: #E87FA5;
+    --pos-def: #A6A6A0;
+
+    --conf-high: #4CC38A;
+    --conf-medium: #FF6A45;
+    --conf-low: #6E6E68;
+    --weather-ok: #4CC38A;
+    --weather-warn: #FF6A45;
+    --weather-bad: #E0604F;
+
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+    --shadow-lg: 0 12px 32px rgba(0,0,0,0.5);
+    --shadow-xl: 0 24px 64px rgba(0,0,0,0.55);
+    --shadow-glow: 0 0 0 3px rgba(255,106,69,0.25);
+    --shadow-glow-amber: 0 0 0 3px rgba(255,106,69,0.25);
+
+    --sidebar-bg: #0B0D0C;
+    --sidebar-border: rgba(255,255,255,0.06);
+    --sidebar-bg-hover: rgba(255,255,255,0.05);
+    --sidebar-bg-active: rgba(255,255,255,0.07);
+    --sidebar-text-active: #FFFFFF;
+
+    --topbar-bg: rgba(22, 25, 24, 0.9);
+    --topbar-border: rgba(255,255,255,0.08);
+
+    --color-primary: #5BBF84;
+    --color-on-primary: #101312;
+    --color-secondary: #5EA8DC;
+    --color-accent: #FF6A45;
+    --kpi-good: #4CC38A;
+    --kpi-ok: #FF6A45;
+    --kpi-bad: #E0604F;
+
+    --card-bg: var(--surface);
+
+    --sidebar-gradient: linear-gradient(180deg, #0B0D0C 0%, #101312 100%);
+    --glow-primary: 0 0 16px rgba(91, 191, 132, 0.20);
+    --glow-amber: 0 0 16px rgba(255, 106, 69, 0.25);
+    --glow-emerald: 0 0 16px rgba(76, 195, 138, 0.20);
+    --glow-sky: 0 0 16px rgba(94, 168, 220, 0.20);
+    --hero-gradient: none;
+    --kpi-accent-good: var(--emerald);
+    --kpi-accent-ok: var(--amber);
+    --kpi-accent-bad: var(--crimson);
+
+    --glass-bg: var(--surface);
+    --glass-border: var(--border);
+    --glass-blur: 0px;
+
+    --mesh-1: transparent;
+    --mesh-2: transparent;
+    --mesh-3: transparent;
+  }
+}
+
+:root[data-theme="dark"] {
+    --bg: #0E100F;
+    --bg-rgb: 14, 16, 15;
+    --surface: #161918;
+    --surface-rgb: 22, 25, 24;
+    --surface-raised: #1C201E;
+    --surface-hover: #232825;
+    --surface-glass: rgba(22, 25, 24, 0.85);
+    --border: rgba(255,255,255,0.08);
+    --border-strong: rgba(255,255,255,0.14);
+    --border-active: #FF6A45;
+
+    --text: #ECECE7;
+    --text-rgb: 236, 236, 231;
+    --text-muted: #A6A6A0;
+    --text-faint: #6E6E68;
+    --text-inverse: #101312;
+
+    --flag: #FF6A45;
+    --flag-rgb: 255, 200, 46;
+    --flag-ink: #101312;
+    --field: #5BBF84;
+    --field-rgb: 91, 191, 132;
+    --paper: #0E100F;
+    --ink: #ECECE7;
+    --rule: rgba(255,255,255,0.08);
+
+    --primary: #5BBF84;
+    --primary-rgb: 91, 191, 132;
+    --primary-light: #8FD6A4;
+    --primary-dim: rgba(91, 191, 132, 0.10);
+    --primary-hover: #8FD6A4;
+
+    --amber: #FF6A45;
+    --amber-rgb: 255, 106, 69;
+    --amber-dim: rgba(255, 106, 69, 0.12);
+    --amber-glow: rgba(255, 106, 69, 0.30);
+    --amber-strong: #FF8A6B;
+
+    --emerald: #4CC38A;
+    --emerald-rgb: 76, 195, 138;
+    --emerald-dim: rgba(76, 195, 138, 0.12);
+    --crimson: #E0604F;
+    --crimson-rgb: 224, 96, 79;
+    --crimson-dim: rgba(224, 96, 79, 0.12);
+    --sky: #5EA8DC;
+    --sky-rgb: 94, 168, 220;
+    --sky-dim: rgba(94, 168, 220, 0.12);
+    --violet: #A68CF0;
+    --violet-rgb: 166, 140, 240;
+    --violet-dim: rgba(166, 140, 240, 0.12);
+
+    --pos-qb: #5EA8DC;
+    --pos-rb: #4CC38A;
+    --pos-wr: #FF8A5C;
+    --pos-te: #A68CF0;
+    --pos-k: #E87FA5;
+    --pos-def: #A6A6A0;
+
+    --conf-high: #4CC38A;
+    --conf-medium: #FF6A45;
+    --conf-low: #6E6E68;
+    --weather-ok: #4CC38A;
+    --weather-warn: #FF6A45;
+    --weather-bad: #E0604F;
+
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+    --shadow-lg: 0 12px 32px rgba(0,0,0,0.5);
+    --shadow-xl: 0 24px 64px rgba(0,0,0,0.55);
+    --shadow-glow: 0 0 0 3px rgba(255,106,69,0.25);
+    --shadow-glow-amber: 0 0 0 3px rgba(255,106,69,0.25);
+
+    --sidebar-bg: #0B0D0C;
+    --sidebar-border: rgba(255,255,255,0.06);
+    --sidebar-bg-hover: rgba(255,255,255,0.05);
+    --sidebar-bg-active: rgba(255,255,255,0.07);
+    --sidebar-text-active: #FFFFFF;
+
+    --topbar-bg: rgba(22, 25, 24, 0.9);
+    --topbar-border: rgba(255,255,255,0.08);
+
+    --color-primary: #5BBF84;
+    --color-on-primary: #101312;
+    --color-secondary: #5EA8DC;
+    --color-accent: #FF6A45;
+    --kpi-good: #4CC38A;
+    --kpi-ok: #FF6A45;
+    --kpi-bad: #E0604F;
+
+    --card-bg: var(--surface);
+
+    --sidebar-gradient: linear-gradient(180deg, #0B0D0C 0%, #101312 100%);
+    --glow-primary: 0 0 16px rgba(91, 191, 132, 0.20);
+    --glow-amber: 0 0 16px rgba(255, 106, 69, 0.25);
+    --glow-emerald: 0 0 16px rgba(76, 195, 138, 0.20);
+    --glow-sky: 0 0 16px rgba(94, 168, 220, 0.20);
+    --hero-gradient: none;
+    --kpi-accent-good: var(--emerald);
+    --kpi-accent-ok: var(--amber);
+    --kpi-accent-bad: var(--crimson);
+
+    --glass-bg: var(--surface);
+    --glass-border: var(--border);
+    --glass-blur: 0px;
+
+    --mesh-1: transparent;
+    --mesh-2: transparent;
+    --mesh-3: transparent;
+}

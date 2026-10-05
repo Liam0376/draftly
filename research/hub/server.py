@@ -1,0 +1,2653 @@
+#!/usr/bin/env python3
+"""
+hub/server.py — read-only DB proxy for the hub.
+Isolation contract:
+- Binds 127.0.0.1:8002 by default — never 0.0.0.0 (see docs/RUNBOOK.md, CLAUDE.md hard constraints)
+- Opens data/fantasy.db with mode=ro (SQLite rejects writes)
+- Never imports src/ffanalytics; math below is vendored read-only mirror
+- No POST, no writes, no LLM calls
+
+Run: .venv/bin/python hub/server.py
+  or: python hub/server.py --db data/fantasy.db --port 8002
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+import time
+from email.utils import formatdate
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timedelta
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
+# Audit: thread safety for global caches (if moved to ThreadingHTTPServer)
+_CACHE_LOCK = threading.Lock()
+# Single-flight locks for Sleeper refresh — never hold _CACHE_LOCK across network I/O.
+_SLEEPER_FETCH_LOCK = threading.Lock()
+_SLEEPER_USERS_FETCH_LOCK = threading.Lock()
+_SLEEPER_PLAYERS_TTL = 24 * 3600
+_SLEEPER_PLAYERS_AT = 0.0
+_SLEEPER_USERS_TTL = 3600
+# why dicts keyed by league_id: users differ per league (players/nfl is
+# league-independent and stays a single global).
+_SLEEPER_USERS_AT: dict = {}
+# rosters-full: one build_league_analytics pass cached 60s + Last-Modified
+_ROSTERS_FULL_TTL = 60
+_ROSTERS_FULL_CACHE = {"at": 0.0, "payload": None, "last_modified": ""}
+# projections + comparison mirror rosters-full: 60s server TTL + Last-Modified/304
+_PROJECTIONS_TTL = 60
+_PROJECTIONS_CACHE = {"at": 0.0, "payload": None, "last_modified": ""}
+_COMPARISON_TTL = 60
+_COMPARISON_CACHE = {"at": 0.0, "payload": None, "last_modified": ""}
+# configured-leagues scan (data/fantasy*.db): 300s TTL, read-only
+_LEAGUES_CACHE = {"at": 0.0, "payload": None}
+# draft info per league (live Sleeper): 1h TTL — draft type rarely changes
+_DRAFT_TTL = 3600
+_DRAFT_CACHE = {}  # league_id -> {"at": float, "payload": dict}
+
+# --- Vendored scoring logic (mirror of src/ffanalytics/scoring.py @ 2026-08-28 Sleeper Bahamas) ---
+DEFAULT_SCORING = {
+    "rec": 1.0, "rec_yd": 0.1, "rush_yd": 0.1, "pass_yd": 0.04,
+    "pass_td": 5.0, "rush_td": 6.0, "rec_td": 6.0, "pass_int": -1.0,
+    "pass_cmp_40p": 1.0, "rush_40p": 1.0, "rec_40p": 1.0,
+    "pass_td_40p": 1.0, "rush_td_40p": 1.0, "rec_td_40p": 1.0,
+    "fgm_0_19": 3.0, "fgm_20_29": 3.0, "fgm_30_39": 3.0, "fgm_40_49": 4.0, "fgm_50_59": 5.0, "fgm_60p": 6.0,
+    "fgmiss": -1.0, "fgmiss_0_19": -1.0, "fgmiss_20_29": -1.0,
+    "xpm": 1.0, "xpmiss": -1.0,
+    "fum_lost": -2.0, "fum_rec": 2.0, "fum_rec_td": 6.0, "ff": 1.0,
+    "pass_2pt": 2.0, "rush_2pt": 2.0, "rec_2pt": 2.0,
+}
+FLEX_ELIGIBLE = {"RB", "WR", "TE"}
+FLEX_SCARCITY_MULTIPLIER = 1.05
+
+# --- Vendored stadium coords (mirror of src/ffanalytics/adapters/weather.py
+# STADIUM_COORDS @ 2026-09-15; hub never imports ffanalytics). Keyed by home
+# team abbreviation. Used to join live Open-Meteo rows from the weather table
+# into the NFL slate — schedule wind/temp are observed post-game values, null
+# before kickoff, so without this join preseason slates show wind 0.
+STADIUM_COORDS = {
+    "ARI": (33.5276, -112.2626), "ATL": (33.7554, -84.4010),
+    "BAL": (39.2780, -76.6227), "BUF": (42.7738, -78.7870),
+    "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
+    "CIN": (39.0955, -84.5160), "CLE": (41.5061, -81.6995),
+    "DAL": (32.7473, -97.0945), "DEN": (39.7439, -105.0201),
+    "DET": (42.3400, -83.0456), "GB": (44.5013, -88.0622),
+    "HOU": (29.6847, -95.4107), "IND": (39.7601, -86.1639),
+    "JAX": (30.3239, -81.6373), "KC": (39.0489, -94.4839),
+    "LAC": (33.9535, -118.3392), "LAR": (33.9535, -118.3392),
+    "LV": (36.0909, -115.1833), "MIA": (25.9580, -80.2389),
+    "MIN": (44.9736, -93.2575), "NE": (42.0909, -71.2643),
+    "NO": (29.9511, -90.0812), "NYG": (40.8128, -74.0742),
+    "NYJ": (40.8128, -74.0742), "PHI": (39.9008, -75.1675),
+    "PIT": (40.4468, -80.0158), "SEA": (47.5952, -122.3316),
+    "SF": (37.4033, -121.9694), "TB": (27.9759, -82.5033),
+    "TEN": (36.1665, -86.7713), "WAS": (38.9076, -76.8645),
+}
+
+def count_flex_slots(roster_positions):
+    return sum(1 for p in roster_positions if p == "FLEX")
+
+def apply_flex_adjustment(points: float, position: str, num_flex_slots: int = 2) -> float:
+    if position in FLEX_ELIGIBLE and num_flex_slots >= 2:
+        extra = num_flex_slots - 1
+        adj = 1.0 + (FLEX_SCARCITY_MULTIPLIER - 1.0) * extra
+        return points * adj
+    return points
+
+def _calc_points_from_raw(p: dict, scoring: dict) -> float:
+    # Always score from raw stats using league settings — nflreadpy's fantasy_points
+    # uses standard scoring (4pt pass TD), not our league (5pt pass TD + 40+ bonuses).
+    # map raw keys (nflverse / stat_projector) to Sleeper scoring keys
+    # Audit: guard NaN/inf from CSV (float('nan') truthy but should be 0)
+    def g(*keys):
+        for k in keys:
+            v=p.get(k)
+            if v is not None:
+                try:
+                    fv=float(v)
+                    if fv!=fv or fv==float("inf") or fv==float("-inf"):
+                        continue
+                    return fv
+                except: return 0.0
+        return 0.0
+    # if any raw stat present, score via Sleeper settings
+    raw = {
+        "receptions": g("receptions"),
+        "receiving_yards": g("receiving_yards","rec_yd"),
+        "receiving_tds": g("receiving_tds","rec_td"),
+        "rushing_yards": g("rushing_yards","rush_yd"),
+        "rushing_tds": g("rushing_tds","rush_td"),
+        "passing_yards": g("passing_yards","pass_yd","passing_yards"),
+        "passing_tds": g("passing_tds","pass_td"),
+        "interceptions": g("passing_interceptions","pass_int","interceptions"),
+        "fumbles_lost": g("fumbles_lost_total","fum_lost","fumbles_lost"),
+        "passing_2pt": g("passing_2pt_conversions","pass_2pt"),
+        "rushing_2pt": g("rushing_2pt_conversions","rush_2pt"),
+        "receiving_2pt": g("receiving_2pt_conversions","rec_2pt"),
+        "passing_40": g("passing_40","pass_40"),
+        "rushing_40": g("rushing_40","rush_40"),
+        "receiving_40": g("receiving_40","rec_40"),
+        "fg_made_0_19": g("fg_made_0_19"),
+        "fg_made_20_29": g("fg_made_20_29"),
+        "fg_made_30_39": g("fg_made_30_39"),
+        "fg_made_40_49": g("fg_made_40_49"),
+        "fg_made_50_59": g("fg_made_50_59"),
+        "fg_made_60_": g("fg_made_60_","fg_made_60p"),
+        "fg_missed": g("fg_missed"),
+        "pat_made": g("pat_made"),
+        "pat_missed": g("pat_missed"),
+    }
+    # quick check: if all zero, try direct fantasy_points fallback again
+    if all(v==0 for v in raw.values()):
+        return float(p.get("fantasy_points") or p.get("pts_ppr") or 0)
+    # Sleeper scoring map (subset, rest defaults to 0 via dict.get)
+    stat_to_key = {
+        "receptions":"rec","receiving_yards":"rec_yd","rushing_yards":"rush_yd","passing_yards":"pass_yd",
+        "passing_tds":"pass_td","rushing_tds":"rush_td","receiving_tds":"rec_td","interceptions":"pass_int","fumbles_lost":"fum_lost",
+        "passing_2pt":"pass_2pt","rushing_2pt":"rush_2pt","receiving_2pt":"rec_2pt",
+        "passing_40":"pass_cmp_40p","rushing_40":"rush_40p","receiving_40":"rec_40p",
+        "fg_made_0_19":"fgm_0_19","fg_made_20_29":"fgm_20_29","fg_made_30_39":"fgm_30_39","fg_made_40_49":"fgm_40_49","fg_made_50_59":"fgm_50_59","fg_made_60_":"fgm_60p",
+        "fg_missed":"fgmiss","pat_made":"xpm","pat_missed":"xpmiss",
+    }
+    pts=0.0
+    for sk, s_key in stat_to_key.items():
+        raw_v=raw.get(sk,0)
+        # Guard NaN raw (audit edge-case 13)
+        try:
+            if isinstance(raw_v,float) and (raw_v!=raw_v or raw_v==float("inf") or raw_v==float("-inf")):
+                raw_v=0
+        except Exception:
+            raw_v=0
+        mult=scoring.get(s_key,0)
+        try:
+            if isinstance(mult,float) and (mult!=mult or mult==float("inf") or mult==float("-inf")):
+                mult=0
+        except Exception:
+            mult=0
+        pts+= raw_v * float(mult)
+    # 40+ TD bonuses if present as separate keys (rare)
+    for k in ("passing_td_40","rushing_td_40","receiving_td_40"):
+        if p.get(k):
+            try:
+                fv=float(p.get(k))
+                if fv!=fv or fv==float("inf") or fv==float("-inf"):
+                    continue
+                pts+= fv * scoring.get(k.replace("_td_40","_td_40p").replace("passing","pass").replace("rushing","rush").replace("receiving","rec"),0)
+            except: pass
+    if pts!=pts or pts==float("inf") or pts==float("-inf"):
+        return 0.0
+    return pts
+
+# --- Vendored floor/ceiling (mirrors src/ffanalytics/stat_projector.py
+# INTERVAL_TABLE + interval_bounds; pinned by tests/test_interval_parity.py) ---
+INTERVAL_TABLE = {
+    "QB": [(4.2, 0.0, 14.0), (11.0, 3.2, 22.2), (14.7, 8.8, 24.7), (17.1, 10.1, 24.1), (19.5, 11.0, 28.9), (23.4, 14.2, 29.8)],
+    "RB": [(0.7, 0.0, 1.4), (1.9, 0.0, 4.2), (3.4, 0.4, 7.0), (5.1, 1.1, 9.4), (7.2, 2.3, 12.5), (10.1, 4.3, 15.9), (13.5, 7.4, 20.2), (18.8, 9.9, 25.0)],
+    "WR": [(0.6, 0.0, 2.0), (2.0, 0.0, 4.2), (3.5, 0.0, 7.4), (5.1, 1.0, 8.6), (7.0, 1.7, 10.8), (9.3, 3.1, 15.6), (12.1, 5.1, 18.9), (17.0, 7.8, 21.8)],
+    "TE": [(0.8, 0.0, 2.4), (2.0, 0.0, 4.1), (3.2, 0.0, 6.1), (4.5, 1.3, 7.1), (6.3, 2.4, 10.8), (8.6, 3.7, 14.4), (12.6, 4.8, 18.7)],
+    "K": [(5.8, 4.0, 12.0), (7.6, 4.0, 12.0), (8.7, 4.0, 12.0), (10.7, 4.0, 13.0)],
+}
+
+
+def interval_bounds(point, position):
+    pts = INTERVAL_TABLE.get((position or "").upper()) or INTERVAL_TABLE["WR"]
+    if point <= pts[0][0]:
+        c, lo, hi = pts[0]
+    elif point >= pts[-1][0]:
+        c, lo, hi = pts[-1]
+    else:
+        for (c0, lo0, hi0), (c1, lo1, hi1) in zip(pts, pts[1:]):
+            if point <= c1:
+                f = (point - c0) / (c1 - c0)
+                c, lo, hi = point, lo0 + f * (lo1 - lo0), hi0 + f * (hi1 - hi0)
+                break
+    return max(0.0, min(point, point - (c - lo))), max(point, point + (hi - c))
+
+
+Z80 = 0.8416
+TOSS_UP_PROB = 0.40
+
+
+def beat_prob(mu_a, lo_a, hi_a, mu_b, lo_b, hi_b):
+    """P(a outscores b) from both players' P20/P80 ranges (mirrors decision.beat_prob)."""
+    import math
+    s = math.hypot((hi_a - lo_a) / (2 * Z80), (hi_b - lo_b) / (2 * Z80))
+    if s == 0:
+        return 0.5 if mu_a == mu_b else float(mu_a > mu_b)
+    return 0.5 * (1 + math.erf((mu_a - mu_b) / (s * math.sqrt(2))))
+
+
+# --- Vendored conformal (minimal, mirrors src/ffanalytics/conformal.py) ---
+def qhat(residuals, alpha=0.2):
+    import math
+    # why explicit 5.0 on empty (correctness batch 2026-09-12): src raises
+    # ValueError on empty and projection.py falls back to 5.0. The prior
+    # WR-residual fallback silently returned 10.2 for an explicit empty
+    # input. None (no input) still uses the WR default for unknown position.
+    if residuals is None:
+        residuals = [0.7,1.8,3.0,4.4,5.8,7.2,8.8,10.2,11.9]
+    if isinstance(residuals, list) and len(residuals) == 0:
+        return 5.0
+    # Filter NaN/inf
+    clean=[]
+    for r in residuals:
+        try:
+            fv=float(r)
+            if fv!=fv or fv==float("inf") or fv==float("-inf"):
+                continue
+            clean.append(abs(fv))
+        except Exception:
+            continue
+    if not clean:
+        return 5.0
+    a = sorted(clean)
+    n = len(a)
+    rank = math.ceil((n + 1) * (1 - alpha))
+    rank = min(rank, n)
+    return a[rank - 1]
+
+# --- Vendored week calc (mirrors src/ffanalytics/config.py) ---
+# Both return 1 preseason so the UI always has a valid 1-18 week slate.
+# Unified 2026-09-03 (config returned 0 before, hub returned 1).
+def compute_nfl_week(now=None):
+    if now is None:
+        now = datetime.now()
+    sept1 = datetime(now.year, 9, 1)
+    offset = (0 - sept1.weekday()) % 7
+    labor_day = sept1 + timedelta(days=offset)
+    season_start = labor_day + timedelta(days=7)
+    if now < season_start:
+        return 1
+    days = (now - season_start).days
+    w = days // 7 + 1
+    # NFL weeks run Thu-Wed. Mon-based calc undercounts Tue-Sat.
+    if now.weekday() >= 1:
+        w += 1
+    return max(1, min(18, w))
+
+def get_db_path(cli_path: str | None) -> Path:
+    # Allowlist: DB must live inside repo data/ dir.
+    # Rejects "..", absolute escapes outside repo, and file: URI metachars ?#.
+    here = Path(__file__).resolve()
+    repo_root = here.parent.parent
+    data_dir = repo_root / "data"
+    try:
+        data_resolved = data_dir.resolve()
+    except Exception:
+        data_resolved = data_dir
+    raw = None
+    if cli_path:
+        raw = str(cli_path)
+    else:
+        # hub/server.py -> repo root is parent of hub/
+        env = os.environ.get("FFANALYTICS_DB_PATH")
+        if env:
+            raw = str(env)
+        else:
+            return repo_root / "data" / "fantasy.db"
+    if not raw:
+        return repo_root / "data" / "fantasy.db"
+    # file: URI query/fragment metachars would break mode=ro URI — reject.
+    if "?" in raw or "#" in raw:
+        raise ValueError("invalid DB path: must be inside data/")
+    # Explicit parent-traversal rejection (even if it would resolve inside).
+    if ".." in Path(raw).parts:
+        raise ValueError("invalid DB path: must be inside data/")
+    p = Path(raw)
+    try:
+        base = Path.cwd()
+        candidate = (p if p.is_absolute() else (base / p)).resolve()
+    except Exception:
+        raise ValueError("invalid DB path: must be inside data/")
+    try:
+        candidate.relative_to(data_resolved)
+    except ValueError:
+        raise ValueError("invalid DB path: must be inside data/")
+    return candidate
+
+_LEAGUE_ID_RE = re.compile(r"^\d+$")
+
+
+def default_league_id() -> str:
+    # why env-backed default: single-league installs keep working with no
+    # ?league_id= anywhere; "" means unconfigured (setup screen takes over).
+    return (os.environ.get("SLEEPER_LEAGUE_ID") or "").strip()
+
+
+def resolve_league_id(qs) -> str:
+    # why ?league_id= > env: the UI switcher passes the active league per
+    # request; validated numeric so it can safely become a filename below.
+    raw = qs.get("league_id", [None])[0] if isinstance(qs, dict) else None
+    raw = str(raw or "").strip()
+    if raw:
+        if not _LEAGUE_ID_RE.match(raw):
+            raise ValueError("invalid league_id: numeric Sleeper id required")
+        return raw
+    return default_league_id()
+
+
+def db_path_for_request(league_id: str | None) -> Path:
+    # why mirror (not import): hub must never import ffanalytics (isolation
+    # gate) — canonical rule lives in ffanalytics.config.db_path_for_league.
+    # Default/env league keeps legacy data/fantasy.db; other leagues get
+    # data/fantasy_<id>.db. Same allowlist guarantees as get_db_path.
+    here = Path(__file__).resolve()
+    repo_root = here.parent.parent
+    data_dir = (repo_root / "data").resolve()
+    lid = (league_id or "").strip()
+    default_lid = default_league_id()
+    if not lid or (default_lid and lid == default_lid):
+        name = "fantasy.db"
+    else:
+        if not _LEAGUE_ID_RE.match(lid):
+            raise ValueError("invalid league_id: numeric Sleeper id required")
+        name = f"fantasy_{lid}.db"
+    candidate = (data_dir / name).resolve()
+    try:
+        candidate.relative_to(data_dir)
+    except ValueError:
+        raise ValueError("invalid DB path: must be inside data/")
+    return candidate
+
+
+def list_configured_leagues() -> list:
+    # why scan (not registry): leagues appear by refreshing (model writes
+    # data/fantasy_<id>.db) — the switcher discovers them with zero config.
+    # 300s TTL; read-only opens; unreadable files are skipped, never fatal.
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _LEAGUES_CACHE.get("payload")
+        if cached is not None and (now - _LEAGUES_CACHE.get("at", 0.0) < 300):
+            return cached
+    here = Path(__file__).resolve()
+    data_dir = here.parent.parent / "data"
+    out = []
+    try:
+        files = sorted(data_dir.glob("fantasy*.db"))
+    except Exception:
+        files = []
+    for f in files:
+        if f.name in ("fantasy.db",) or re.fullmatch(r"fantasy_\d+\.db", f.name):
+            try:
+                conn = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
+                try:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT data FROM league_settings ORDER BY season DESC LIMIT 1"
+                    ).fetchone()
+                    data = json.loads(row["data"]) if row else {}
+                finally:
+                    conn.close()
+                out.append({
+                    "league_id": str(data.get("league_id") or ""),
+                    "league_name": data.get("name") or data.get("league_name") or f.name,
+                    "season": data.get("season") or "",
+                    "db_file": f.name,
+                })
+            except Exception:
+                continue
+    # why default first: the env league is the primary; others alphabetical.
+    default_lid = default_league_id()
+    out.sort(key=lambda e: (e.get("league_id") != default_lid, e.get("league_name") or ""))
+    with _CACHE_LOCK:
+        _LEAGUES_CACHE["payload"] = out
+        _LEAGUES_CACHE["at"] = now
+    return out
+
+def get_conn(db_path: Path) -> sqlite3.Connection:
+    # read-only, immutable when possible; uri=True required for mode=ro
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_nfl_opponent_map(target_wk: int = 1) -> dict[str, str]:
+    here = Path(__file__).resolve()
+    repo_root = here.parent.parent
+    sched_file = repo_root / "data" / "nfl_cache" / "schedule_2026.json"
+    if not sched_file.exists():
+        sched_file = repo_root / "data" / "nfl_cache" / "schedule_2025.json"
+    if not sched_file.exists():
+        return {}
+    try:
+        with open(sched_file) as f:
+            games = json.load(f)
+        opp_map = {}
+        for g in games:
+            if g.get("week") == target_wk:
+                home = g.get("home_team")
+                away = g.get("away_team")
+                if home and away:
+                    opp_map[home] = away
+                    opp_map[away] = home
+        return opp_map
+    except Exception:
+        return {}
+
+def try_fetch_one(conn, sql, params=()):
+    try:
+        row = conn.execute(sql, params).fetchone()
+        return row
+    except Exception:
+        return None
+
+def load_json_blob(row, key="data"):
+    if not row:
+        return None
+    raw = row[key] if isinstance(row, sqlite3.Row) else row[0]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+SLEEPER_PLAYERS_CACHE = {}
+SLEEPER_USERS_CACHE = {}
+
+
+def _fetch_sleeper_players_from_network():
+    # Network I/O helper — never call with _CACHE_LOCK held.
+    # why timeout=30 + 1 retry: the payload is ~14MB; the old timeout=5
+    # aborted slow connections, leaving SLEEPER_PLAYERS_CACHE empty forever
+    # (no stale to serve on fresh start) which silently killed ALL gsis-keyed
+    # headshots (sleeper_id enrichment) across projections/auction/tierlists.
+    import time
+    import urllib.request
+    last_exc = None
+    for _attempt in (1, 2):
+        try:
+            req = urllib.request.urlopen("https://api.sleeper.app/v1/players/nfl", timeout=30)
+            return json.loads(req.read().decode())
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(1)
+    raise last_exc
+
+
+def _fetch_sleeper_users_from_network(league_id: str | None = None):
+    # Network I/O helper — never call with _CACHE_LOCK held.
+    # why league param (not hardcoded): multi-league — users differ per
+    # league; falls back to the env default for legacy callers.
+    import urllib.request
+    lid = (league_id or "").strip() or default_league_id()
+    req = urllib.request.urlopen(f"https://api.sleeper.app/v1/league/{lid}/users", timeout=5)
+    return json.loads(req.read().decode())
+
+
+def _fetch_draft_info_from_network(league_id: str):
+    # why proxy-live (not model): the setup screen needs league identity +
+    # draft type before any refresh exists and even when :8000 is down.
+    # 1h TTL per league; pre-draft leagues (no draft_id) yield type unknown.
+    import urllib.request
+
+    def _get(url: str):
+        req = urllib.request.urlopen(url, timeout=10)
+        return json.loads(req.read().decode())
+
+    league = _get(f"https://api.sleeper.app/v1/league/{league_id}")
+    info = {
+        "league_id": str(league.get("league_id") or league_id),
+        "league_name": league.get("name") or "",
+        "season": str(league.get("season") or ""),
+        "total_rosters": league.get("total_rosters", 12),
+        "draft_id": league.get("draft_id"),
+        "draft_type": "unknown",
+        "auction_budget": None,
+        "draft_settings": {},
+    }
+    if league.get("draft_id"):
+        try:
+            draft = _get(f"https://api.sleeper.app/v1/draft/{league.get('draft_id')}")
+        except Exception:
+            draft = {}
+        dtype = str((draft or {}).get("type") or "").lower()
+        if dtype in ("snake", "auction"):
+            info["draft_type"] = dtype
+        settings = (draft or {}).get("settings") or {}
+        info["draft_settings"] = settings
+        for key in ("budget", "auction_budget", "salary_cap", "cap"):
+            val = settings.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                info["auction_budget"] = val
+                break
+    return info
+
+
+def get_cached_draft_info(league_id: str) -> dict:
+    now = time.time()
+    with _CACHE_LOCK:
+        entry = _DRAFT_CACHE.get(league_id)
+        if entry and (now - entry.get("at", 0.0) < _DRAFT_TTL):
+            return entry["payload"]
+    payload = _fetch_draft_info_from_network(league_id)
+    with _CACHE_LOCK:
+        _DRAFT_CACHE[league_id] = {"at": now, "payload": payload}
+    return payload
+
+
+def _ensure_sleeper_players_refresh_background():
+    # Trigger single-flight background refresh; serve stale meanwhile.
+    if _SLEEPER_FETCH_LOCK.locked():
+        return
+
+    def _bg():
+        acquired = _SLEEPER_FETCH_LOCK.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            try:
+                data = _fetch_sleeper_players_from_network()
+            except Exception:
+                return  # serve stale on failure
+            if isinstance(data, dict) and data:
+                global SLEEPER_PLAYERS_CACHE, _SLEEPER_PLAYERS_AT
+                with _CACHE_LOCK:
+                    SLEEPER_PLAYERS_CACHE = data
+                    _SLEEPER_PLAYERS_AT = time.time()
+        finally:
+            try:
+                _SLEEPER_FETCH_LOCK.release()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
+
+
+def _ensure_sleeper_users_refresh_background(league_id: str | None = None):
+    if _SLEEPER_USERS_FETCH_LOCK.locked():
+        return
+
+    def _bg():
+        acquired = _SLEEPER_USERS_FETCH_LOCK.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            try:
+                users_list = _fetch_sleeper_users_from_network(league_id)
+            except Exception:
+                return  # serve stale on failure
+            if isinstance(users_list, list) and users_list:
+                fresh = {}
+                for u in users_list:
+                    if not isinstance(u, dict):
+                        continue
+                    uid = str(u.get("user_id") or "")
+                    if not uid:
+                        continue
+                    meta = u.get("metadata") or {}
+                    avatar = u.get("avatar")
+                    avatar_url = f"https://sleepercdn.com/avatars/thumbs/{avatar}" if avatar else None
+                    fresh[uid] = {
+                        "user_id": uid,
+                        "display_name": u.get("display_name") or uid,
+                        "team_name": meta.get("team_name") or u.get("display_name") or f"Team {uid[:4]}",
+                        "avatar": avatar,
+                        "avatar_url": avatar_url,
+                    }
+                global SLEEPER_USERS_CACHE, _SLEEPER_USERS_AT
+                # why keyed by league: users differ per league; a single
+                # global dict would serve league A's managers inside league B.
+                key = (league_id or "").strip() or default_league_id() or "default"
+                with _CACHE_LOCK:
+                    SLEEPER_USERS_CACHE[key] = fresh
+                    _SLEEPER_USERS_AT[key] = time.time()
+        finally:
+            try:
+                _SLEEPER_USERS_FETCH_LOCK.release()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
+
+
+def warm_sleeper_caches_async():
+    # Startup-warmed cache: prefetch players/users in background so request
+    # path serves cache without blocking urlopen. Safe to call multiple times.
+    global _SLEEPER_PLAYERS_AT, _SLEEPER_USERS_AT
+    with _CACHE_LOCK:
+        players_empty = not SLEEPER_PLAYERS_CACHE
+        dkey = default_league_id() or "default"
+        users_empty = not SLEEPER_USERS_CACHE.get(dkey)
+    if players_empty:
+        _ensure_sleeper_players_refresh_background()
+    if users_empty:
+        _ensure_sleeper_users_refresh_background()
+
+
+def get_sleeper_players_cached() -> dict:
+    # TTL + single-flight + serve-stale. Never holds _CACHE_LOCK across I/O.
+    # Double-checked locking: fast check under lock, fetch without lock,
+    # re-check after acquiring single-flight lock.
+    global SLEEPER_PLAYERS_CACHE, _SLEEPER_PLAYERS_AT
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = SLEEPER_PLAYERS_CACHE
+        at = _SLEEPER_PLAYERS_AT
+        if cached and (now - at < _SLEEPER_PLAYERS_TTL):
+            return cached
+        stale = cached
+    if stale:
+        # Stale present: refresh in background, serve stale now (off request path).
+        _ensure_sleeper_players_refresh_background()
+        return stale
+    # Cold miss: single-flight synchronous fetch (startup path only).
+    acquired = _SLEEPER_FETCH_LOCK.acquire(blocking=False)
+    if not acquired:
+        with _CACHE_LOCK:
+            return SLEEPER_PLAYERS_CACHE
+    try:
+        with _CACHE_LOCK:
+            if SLEEPER_PLAYERS_CACHE and (time.time() - _SLEEPER_PLAYERS_AT < _SLEEPER_PLAYERS_TTL):
+                return SLEEPER_PLAYERS_CACHE
+        try:
+            data = _fetch_sleeper_players_from_network()
+        except Exception:
+            with _CACHE_LOCK:
+                return SLEEPER_PLAYERS_CACHE  # serve stale (possibly {}) on failure
+        with _CACHE_LOCK:
+            if isinstance(data, dict) and data:
+                SLEEPER_PLAYERS_CACHE = data
+                _SLEEPER_PLAYERS_AT = time.time()
+            return SLEEPER_PLAYERS_CACHE
+    finally:
+        try:
+            _SLEEPER_FETCH_LOCK.release()
+        except Exception:
+            pass
+
+
+def get_sleeper_users(conn=None, league_id: str | None = None):
+    # why keyed: SLEEPER_USERS_CACHE/_SLEEPER_USERS_AT are dicts keyed by
+    # league (DB snapshot path is already per-conn, i.e. per league).
+    global SLEEPER_USERS_CACHE, _SLEEPER_USERS_AT
+    key = (league_id or "").strip() or default_league_id() or "default"
+    now = time.time()
+    with _CACHE_LOCK:
+        per = SLEEPER_USERS_CACHE.get(key) or {}
+        at = _SLEEPER_USERS_AT.get(key, 0.0)
+        if per and (now - at < _SLEEPER_USERS_TTL):
+            return per
+        stale = dict(per) if per else {}
+    # Prefer DB snapshot (fast, no network, no lock held across I/O).
+    if conn is not None:
+        try:
+            row = try_fetch_one(conn, "SELECT data FROM league_settings ORDER BY season DESC LIMIT 1")
+            l_data = load_json_blob(row) or {}
+            db_users = l_data.get("users") or []
+            fresh = {}
+            for u in db_users:
+                if isinstance(u, dict):
+                    uid = str(u.get("user_id", ""))
+                    if uid:
+                        avatar = u.get("avatar")
+                        avatar_url = f"https://sleepercdn.com/avatars/thumbs/{avatar}" if avatar else None
+                        fresh[uid] = {
+                            "user_id": uid,
+                            "display_name": u.get("display_name") or uid,
+                            "team_name": u.get("team_name") or u.get("display_name") or f"Team {uid[:4]}",
+                            "avatar": avatar,
+                            "avatar_url": avatar_url,
+                        }
+            if fresh:
+                with _CACHE_LOCK:
+                    SLEEPER_USERS_CACHE[key] = fresh
+                    _SLEEPER_USERS_AT[key] = time.time()
+                    return SLEEPER_USERS_CACHE[key]
+        except Exception:
+            pass
+    if stale:
+        _ensure_sleeper_users_refresh_background(key if key != "default" else None)
+        return stale
+    acquired = _SLEEPER_USERS_FETCH_LOCK.acquire(blocking=False)
+    if not acquired:
+        with _CACHE_LOCK:
+            return SLEEPER_USERS_CACHE.get(key) or {}
+    try:
+        with _CACHE_LOCK:
+            per = SLEEPER_USERS_CACHE.get(key) or {}
+            if per and (time.time() - _SLEEPER_USERS_AT.get(key, 0.0) < _SLEEPER_USERS_TTL):
+                return per
+        try:
+            users_list = _fetch_sleeper_users_from_network(key if key != "default" else None)
+        except Exception:
+            with _CACHE_LOCK:
+                return SLEEPER_USERS_CACHE.get(key) or {}  # serve stale on failure
+        fresh = {}
+        for u in users_list if isinstance(users_list, list) else []:
+            if not isinstance(u, dict):
+                continue
+            uid = str(u.get("user_id") or "")
+            if not uid:
+                continue
+            meta = u.get("metadata") or {}
+            avatar = u.get("avatar")
+            avatar_url = f"https://sleepercdn.com/avatars/thumbs/{avatar}" if avatar else None
+            fresh[uid] = {
+                "user_id": uid,
+                "display_name": u.get("display_name") or uid,
+                "team_name": meta.get("team_name") or u.get("display_name") or f"Team {uid[:4]}",
+                "avatar": avatar,
+                "avatar_url": avatar_url,
+            }
+        with _CACHE_LOCK:
+            if fresh:
+                SLEEPER_USERS_CACHE[key] = fresh
+                _SLEEPER_USERS_AT[key] = time.time()
+            return SLEEPER_USERS_CACHE.get(key) or {}
+    finally:
+        try:
+            _SLEEPER_USERS_FETCH_LOCK.release()
+        except Exception:
+            pass
+
+def get_sleeper_player_name(player_id: str) -> str:
+    players = get_sleeper_players_cached()
+    p = players.get(player_id, {}) if isinstance(players, dict) else {}
+    if p:
+        nm = p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        pos = (p.get("position") or ("DEF" if player_id.isalpha() else "")).upper()
+        if nm:
+            return f"{nm} ({pos})" if pos else nm
+        return player_id
+    # Cache miss / unknown ID: return ID without blocking on network (stale served above).
+    return player_id
+
+def _build_sleeper_gsis_map(conn) -> dict:
+    """gsis_id -> sleeper_id. Used by endpoints that need to enrich cached
+    comparison/projection rows whose player_id is a GSIS string."""
+    players = get_sleeper_players_cached()
+    out = {}
+    for sid, sp in (players.items() if isinstance(players, dict) else []):
+        if not isinstance(sp, dict):
+            continue
+        g = sp.get("gsis_id")
+        if g:
+            out[str(g)] = str(sid)
+    return out
+
+def _normalize_team_abbrev(team: str) -> str:
+    """Normalize team abbreviations to match Sleeper's format."""
+    team = (team or "").upper().strip()
+    # Common mappings: comparison uses short names, Sleeper uses full
+    mapping = {
+        "LA": "LAR",  # Rams
+        "JAC": "JAX",
+        "WSH": "WAS",
+        "GB": "GB",
+        "KC": "KC",
+        "LV": "LV",
+        "NE": "NE",
+        "NO": "NO",
+        "SF": "SF",
+        "TB": "TB",
+        "TEN": "TEN",
+    }
+    return mapping.get(team, team)
+
+NFL_TEAM_BYES_CACHE = {}
+
+def get_nfl_team_byes() -> dict[str, int]:
+    global NFL_TEAM_BYES_CACHE
+    with _CACHE_LOCK:
+        if NFL_TEAM_BYES_CACHE:
+            return NFL_TEAM_BYES_CACHE
+    repo_root = Path(__file__).resolve().parent.parent
+    for fname in ["schedule_2026.json", "schedule_2025.json"]:
+        sched_file = repo_root / "data" / "nfl_cache" / fname
+        if sched_file.exists():
+            try:
+                with open(sched_file) as f:
+                    sched = json.load(f)
+                from collections import defaultdict
+                team_weeks = defaultdict(set)
+                for g in sched:
+                    w = g.get("week")
+                    if w and 1 <= w <= 18:
+                        if g.get("home_team"): team_weeks[g["home_team"]].add(w)
+                        if g.get("away_team"): team_weeks[g["away_team"]].add(w)
+                byes = {}
+                for t, weeks in team_weeks.items():
+                    missing = sorted(list(set(range(1, 19)) - weeks))
+                    if missing:
+                        byes[t] = missing[0]
+                if len(byes) >= 30:
+                    NFL_TEAM_BYES_CACHE = byes
+                    return NFL_TEAM_BYES_CACHE
+            except Exception:
+                pass
+    NFL_TEAM_BYES_CACHE = {
+        'ATL': 11, 'NYJ': 13, 'MIA': 6, 'DAL': 14, 'SF': 8, 'LA': 11, 'BUF': 7, 'TB': 10,
+        'MIN': 6, 'TEN': 9, 'LAC': 7, 'LV': 13, 'CLE': 11, 'NE': 11, 'KC': 5, 'HOU': 8,
+        'CIN': 6, 'CAR': 5, 'JAX': 7, 'CHI': 10, 'WAS': 7, 'IND': 13, 'ARI': 14, 'PIT': 9,
+        'NYG': 8, 'SEA': 11, 'PHI': 10, 'DET': 6, 'DEN': 10, 'NO': 8, 'BAL': 13, 'GB': 11
+    }
+    return NFL_TEAM_BYES_CACHE
+
+def _norm_n(name: str) -> str:
+    if not name: return ""
+    import re
+    n = name.lower().strip()
+    n = re.sub(r"\b(jr\.?|sr\.?|ii|iii|iv|v)\b", "", n)
+    n = re.sub(r"[^a-z0-9 ]", "", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def _ros_remaining(ros_map: dict, gsis, pid):
+    """remaining_games from a ros_projections map, GSIS key first then raw
+    pid (dual-key discipline mirrors wk_map). int-or-None: missing row is
+    unknown, 0 is no games left — callers must not conflate them."""
+    v = ros_map.get(str(gsis)) if str(gsis) in ros_map else ros_map.get(str(pid))
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+def build_league_analytics(conn, league_id: str | None = None, week: int | None = None):
+    row = try_fetch_one(conn, "SELECT data FROM rosters ORDER BY rowid DESC LIMIT 1")
+    rosters = load_json_blob(row) or []
+    
+    row = None
+    # why season/week + week<=current (not rowid): rowid order is insertion
+    # order, so a stale future-week demo blob (e.g. legacy week-10 seed) would
+    # shadow real data here just like it did in /projections.
+    _cw = compute_nfl_week()
+    try:
+        row = try_fetch_one(conn, "SELECT data FROM player_stats WHERE json_array_length(data)>0 AND week <= ? ORDER BY season DESC, week DESC, rowid DESC LIMIT 1", (_cw,))
+    except Exception:
+        row = None
+    if not row or not load_json_blob(row):
+        try:
+            for cand in conn.execute("SELECT data, season, week FROM player_stats ORDER BY season DESC, week DESC, rowid DESC LIMIT 10").fetchall():
+                if cand["week"] is not None and int(cand["week"]) > _cw:
+                    continue
+                data = load_json_blob(cand)
+                if isinstance(data, list) and len(data) > 10:
+                    row = cand
+                    break
+        except Exception:
+            pass
+    if not row:
+        row = try_fetch_one(conn, "SELECT data FROM player_stats WHERE week <= ? ORDER BY season DESC, week DESC, rowid DESC LIMIT 1", (_cw,))
+    players = load_json_blob(row) or []
+
+    row = try_fetch_one(conn, "SELECT data FROM injury_status ORDER BY rowid DESC LIMIT 1")
+    injuries = load_json_blob(row) or {}
+
+    comp_row = try_fetch_one(conn, "SELECT data FROM market_consensus ORDER BY fetched_at DESC LIMIT 1")
+    comp_list = load_json_blob(comp_row, key="data") or []
+
+    comp_by_id = {}
+    comp_by_name_pos = {}
+    comp_by_name = {}
+    for c in (comp_list if isinstance(comp_list, list) else []):
+        if isinstance(c, dict):
+            pid = str(c.get("player_id", ""))
+            if pid:
+                comp_by_id[pid] = c
+            p_name = c.get("player_name") or ""
+            pos = (c.get("position") or "").upper()
+            norm = _norm_n(p_name)
+            if norm:
+                if pos:
+                    comp_by_name_pos[(norm, pos)] = c
+                comp_by_name[norm] = c
+
+    # Sleeper players via startup-warmed TTL cache (never blocks on network
+    # when stale data exists; never holds _CACHE_LOCK across I/O).
+    _sleeper_players = get_sleeper_players_cached()
+
+    users_map = get_sleeper_users(conn, league_id)
+    byes_map = get_nfl_team_byes()
+    # PERF: compute once per request — never per-player (was N file reads).
+    _opponent_map = get_nfl_opponent_map(compute_nfl_week())
+
+    # Explicit week (Matchups week picker) — independent per-week rows.
+    # weekly_projections.player_id is GSIS-style (nflverse), but Sleeper's
+    # own /players/nfl only backfills gsis_id for ~1/3 of entries — the
+    # name+position fallback mirrors comp_by_name_pos below for players
+    # Sleeper has no gsis_id for (confirmed live: Jalen Hurts' Sleeper
+    # entry has gsis_id=None despite having real weekly_projections rows).
+    # Both empty when week is None or nothing's precomputed for it yet
+    # (falls through to the season-average/market blend below per-player).
+    wk_map: dict[str, sqlite3.Row] = {}
+    wk_by_name_pos: dict[tuple, sqlite3.Row] = {}
+    if week is not None:
+        try:
+            season_row = try_fetch_one(
+                conn, "SELECT season FROM weekly_projections ORDER BY season DESC LIMIT 1"
+            )
+            if season_row:
+                wk_rows = conn.execute(
+                    "SELECT player_id, player_name, position, opponent_team, projected_points, "
+                    "projection_lower, projection_upper, width FROM weekly_projections "
+                    "WHERE season = ? AND week = ?",
+                    (season_row[0], week),
+                ).fetchall()
+                wk_map = {str(r["player_id"]): r for r in wk_rows}
+                wk_by_name_pos = {
+                    (_norm_n(r["player_name"]), (r["position"] or "").upper()): r
+                    for r in wk_rows
+                }
+        except Exception:
+            wk_map, wk_by_name_pos = {}, {}
+
+    draft_prices = {}
+    try:
+        r_rows = conn.execute("SELECT player_id, amount FROM draft_picks").fetchall()
+        for r in r_rows:
+            if r["player_id"] and r["amount"] is not None:
+                draft_prices[str(r["player_id"])] = float(r["amount"])
+    except Exception:
+        pass
+
+    # ROS map for remaining_games on roster items (trade slot plan, Phase 5):
+    # ros_projections is the only store carrying per-player remaining games.
+    # Missing table/rows → {} and items carry None (None = unknown; 0 would
+    # falsely mean "no games left"). Lookup tries GSIS then raw pid — same
+    # dual-key discipline as wk_map above.
+    ros_map = {}
+    try:
+        for r in conn.execute(
+            "SELECT player_id, remaining_games FROM ros_projections "
+            "WHERE season = (SELECT season FROM ros_projections "
+            "ORDER BY rowid DESC LIMIT 1)"
+        ).fetchall():
+            if r["player_id"] is not None:
+                ros_map[str(r["player_id"])] = r["remaining_games"]
+    except Exception:
+        ros_map = {}
+
+    pmap = {}
+    for p in (players if isinstance(players, list) else []):
+        if isinstance(p, dict):
+            pid = str(p.get("player_id") or p.get("id") or "")
+            if pid: pmap[pid] = p
+
+    teams_data_map = {}
+    team_summaries = []
+
+    for r in (rosters if isinstance(rosters, list) else []):
+        if not isinstance(r, dict): continue
+        r_id = r.get("roster_id")
+        o_id = str(r.get("owner_id") or "")
+        u_info = users_map.get(o_id, {})
+        disp_name = u_info.get("display_name") or u_info.get("team_name") or f"Team {r_id}"
+        t_name = u_info.get("team_name") or u_info.get("display_name") or f"Team {r_id}"
+        avatar = u_info.get("avatar")
+        avatar_url = u_info.get("avatar_url")
+
+        team_info = {
+            "roster_id": r_id,
+            "user_id": o_id,
+            "owner_id": o_id,
+            "owner_name": disp_name,
+            "display_name": disp_name,
+            "team_name": t_name,
+            "avatar": avatar,
+            "avatar_url": avatar_url,
+        }
+
+        ids = r.get("players") or []
+        raw_starters = set(r.get("starters") or [])
+        raw_reserve = set(r.get("reserve") or [])
+
+        starters, bench, reserve = [], [], []
+        pos_counters = {"QB": 0, "RB": 0, "WR": 0, "TE": 0, "FLEX": 0, "K": 0, "DEF": 0}
+
+        for idx, pid in enumerate(ids):
+            sp = (_sleeper_players.get(str(pid), {}) if isinstance(_sleeper_players, dict) else {})
+            p_name = sp.get("full_name") or f"{sp.get('first_name','')} {sp.get('last_name','')}".strip() or str(pid)
+            pos = (sp.get("position") or ("DEF" if str(pid).isalpha() else "UNK")).upper()
+            team = (sp.get("team") or "").upper()
+            gsis = sp.get("gsis_id")
+
+            st = pmap.get(str(gsis) if gsis else str(pid)) or {}
+            comp = (
+                comp_by_id.get(str(pid)) or
+                (comp_by_id.get(str(gsis)) if gsis else None) or
+                comp_by_name_pos.get((_norm_n(p_name), pos)) or
+                comp_by_name.get(_norm_n(p_name)) or
+                {}
+            )
+
+            # Explicit week request (Matchups week picker): prefer the
+            # independent per-week row over the season-average/market blend
+            # below — that blend is itself not week-specific (comp comes
+            # from the latest market_consensus snapshot regardless of which
+            # week is being viewed) and would otherwise silently overwrite
+            # a real per-week number with the current week's.
+            wk_row = None
+            if wk_map or wk_by_name_pos:
+                wk_row = wk_map.get(str(gsis)) or wk_map.get(str(pid))
+                if wk_row is None:
+                    wk_row = wk_by_name_pos.get((_norm_n(p_name), pos))
+
+            if wk_row is not None:
+                pts = float(wk_row["projected_points"] or 0)
+                _lo, _hi = interval_bounds(pts, pos)
+                proj_lower = round(float(wk_row["projection_lower"]), 2) if wk_row["projection_lower"] is not None else round(_lo, 2)
+                proj_upper = round(float(wk_row["projection_upper"]), 2) if wk_row["projection_upper"] is not None else round(_hi, 2)
+                width = float(wk_row["width"]) if wk_row["width"] is not None else round((proj_upper - proj_lower) / 2, 2)
+                wk_opponent = wk_row["opponent_team"] or ""
+            else:
+                # Universal League-Wide Projection Engine for ALL 12 Teams:
+                raw_pts = float(st.get("projected_points") or st.get("fantasy_points") or 0)
+                m_pts = comp.get("model_points")
+                mk_s = comp.get("market_season_points")
+                mk_per_game = round(float(mk_s) / 17.0, 2) if (mk_s is not None and float(mk_s) > 0) else None
+
+                # Always prefer Draftly model projection first:
+                if m_pts is not None and float(m_pts) > 0:
+                    gridiron_pts = float(m_pts)
+                elif raw_pts > 0:
+                    gridiron_pts = raw_pts
+                elif mk_per_game and mk_per_game > 0:
+                    gridiron_pts = mk_per_game
+                else:
+                    gridiron_pts = 0.0
+
+                pts = gridiron_pts
+
+                # Floor/ceiling from the same table as src, at this pts
+                # (asymmetric; width = half-span for spread-scale consumers).
+                _lo, _hi = interval_bounds(pts, pos)
+                proj_lower, proj_upper = round(_lo, 2), round(_hi, 2)
+                width = round((_hi - _lo) / 2, 2)
+                wk_opponent = None
+
+            # Full season projected stats
+            m_season = comp.get("model_season_stats") or {}
+            mk_season = comp.get("market_season_stats") or {}
+            def _get_season_val(k, alts=()):
+                val = m_season.get(k)
+                if val is None: val = mk_season.get(k)
+                if val is None:
+                    for ak in alts:
+                        if ak in m_season: val = m_season[ak]; break
+                        if ak in mk_season: val = mk_season[ak]; break
+                if val is None and st and k in st:
+                    try: val = float(st[k]) * 17.0
+                    except: pass
+                if val is not None:
+                    try: return round(float(val), 1)
+                    except: pass
+                return 0.0
+
+            pass_yds = _get_season_val("passing_yards", ("pass_yds", "pass_yd"))
+            pass_tds = _get_season_val("passing_tds", ("pass_tds", "pass_td"))
+            rush_yds = _get_season_val("rushing_yards", ("rush_yds", "rush_yd"))
+            rush_tds = _get_season_val("rushing_tds", ("rush_tds", "rush_td"))
+            receptions = _get_season_val("receptions", ("rec",))
+            rec_yds = _get_season_val("receiving_yards", ("rec_yds", "rec_yd"))
+            rec_tds = _get_season_val("receiving_tds", ("rec_tds", "rec_td"))
+            targets = _get_season_val("targets")
+            if targets == 0.0 and receptions > 0:
+                targets = round(receptions / 0.70, 1)
+            r_att = _get_season_val("rushing_att")
+            if r_att == 0.0 and rush_yds > 0:
+                r_att = round(rush_yds / 4.2, 1)
+            touches = round(r_att + receptions, 1)
+
+            is_starter = str(pid) in raw_starters or (not raw_starters and idx < 10)
+            is_ir = str(pid) in raw_reserve
+
+            slot_label = "BENCH"
+            if is_ir:
+                slot_label = "IR"
+            elif is_starter:
+                pos_counters[pos] = pos_counters.get(pos, 0) + 1
+                count = pos_counters[pos]
+                if pos == "QB": slot_label = "QB"
+                elif pos == "RB": slot_label = f"RB{count}" if count <= 2 else f"FLEX{count-2}"
+                elif pos == "WR": slot_label = f"WR{count}" if count <= 2 else f"FLEX{count-2}"
+                elif pos == "TE": slot_label = "TE" if count == 1 else f"FLEX{count-1}"
+                elif pos == "K": slot_label = "K"
+                elif pos == "DEF": slot_label = "DEF"
+                else: slot_label = f"SLOT {idx+1}"
+
+            item = {
+                "player_id": str(pid),
+                "player_name": p_name,
+                "position": pos,
+                "team": team,
+                "projected_points": round(pts, 2),
+                "projection_lower": proj_lower,
+                "projection_upper": proj_upper,
+                "width": round(width, 2),
+                "injury_status": injuries.get(str(pid)) or sp.get("injury_status"),
+                "opponent_team": wk_opponent or _opponent_map.get(team) or st.get("opponent_team") or "",
+                "slot": slot_label,
+                # why int-or-None (not `or 0`): a missing ros row means
+                # unknown; 0 means no games left. Dual-key mirrors wk_map.
+                "remaining_games": _ros_remaining(ros_map, gsis, pid),
+                "pass_yds": pass_yds,
+                "pass_tds": pass_tds,
+                "rush_yds": rush_yds,
+                "rush_tds": rush_tds,
+                "receptions": receptions,
+                "rec_yds": rec_yds,
+                "rec_tds": rec_tds,
+                "touches": touches,
+                "targets": targets,
+                # Comparison enrichment
+                "market_season_points": comp.get("market_season_points"),
+                "gridiron_points": round(pts, 2),
+                "model_points": comp.get("model_points") if comp.get("model_points") is not None else round(pts, 2),
+                "model_season_points": comp.get("model_season_points") if comp.get("model_season_points") is not None else round(pts * 17.0, 1),
+                "auction": draft_prices.get(str(pid)) if draft_prices.get(str(pid)) is not None else (comp.get("auction") or 0),
+                "auction_price_paid": draft_prices.get(str(pid)),
+                "marketAuction": draft_prices.get(str(pid)) if draft_prices.get(str(pid)) is not None else (comp.get("marketAuction") or 0),
+                "deltaAuction": round((comp.get("model_season_points", pts * 17.0) / 20.0) - draft_prices[str(pid)], 1) if str(pid) in draft_prices else comp.get("deltaAuction"),
+                "edge": comp.get("edge") or "NEUTRAL",
+                "fp_ecr": comp.get("fp_ecr"),
+                "fp_ecr_pos": comp.get("fp_ecr_pos"),
+                "fp_adp": comp.get("fp_adp"),
+                "fp_tier": comp.get("fp_tier"),
+                "statsguy_rank": comp.get("statsguy_rank"),
+                "statsguy_value": comp.get("statsguy_value"),
+                "season_stat_deltas": comp.get("season_stat_deltas") or [],
+                "market_season_stats": comp.get("market_season_stats") or {},
+            }
+
+            if is_ir:
+                reserve.append(item)
+            elif is_starter:
+                starters.append(item)
+            else:
+                bench.append(item)
+
+        all_rostered = starters + bench + reserve
+
+        # 2. Team Analytics Calculations
+        gridiron_val = round(sum(float(p.get("auction") or 0) for p in all_rostered), 2)
+        market_val = round(sum(float(p.get("marketAuction") or 0) for p in all_rostered), 2)
+        starter_pts = round(sum(float(p.get("projected_points") or 0) for p in starters), 2)
+
+        def _get_p_season(p):
+            if p.get("model_season_points") is not None:
+                return float(p["model_season_points"])
+            if p.get("market_season_points") is not None:
+                return float(p["market_season_points"])
+            return float(p.get("projected_points") or 0) * 17.0
+
+        total_season_pts = round(sum(_get_p_season(p) for p in all_rostered), 2)
+
+        # Position group scores (0-100)
+        pos_benchmarks = {"QB": 35.0, "RB": 75.0, "WR": 75.0, "TE": 30.0}
+        pos_scores = {}
+        for pos_k in ["QB", "RB", "WR", "TE"]:
+            p_list = [p for p in all_rostered if p.get("position") == pos_k]
+            pos_vor = sum(float(p.get("auction") or 0) for p in p_list)
+            bmark = pos_benchmarks.get(pos_k, 50.0)
+            raw_score = (pos_vor / bmark) * 80.0
+            depth_bonus = min(20.0, len(p_list) * 4.0)
+            score = min(100.0, max(15.0, round(raw_score + depth_bonus, 1)))
+            pos_scores[pos_k] = score
+
+        weakest_pos = min(pos_scores, key=pos_scores.get)
+
+        # Bye week matrix (1 to 18)
+        bye_matrix = {w: [] for w in range(1, 19)}
+        for p in all_rostered:
+            tm = p.get("team")
+            bw = byes_map.get(tm)
+            if bw and 1 <= bw <= 18:
+                bye_matrix[bw].append({
+                    "player_id": p["player_id"],
+                    "player_name": p["player_name"],
+                    "position": p["position"],
+                    "team": tm
+                })
+
+        # Start sit tossups
+        tossups = []
+        for b_p in bench:
+            b_pos = b_p.get("position")
+            b_upper = b_p.get("projection_upper", 0)
+            for s_p in starters:
+                s_pos = s_p.get("position")
+                s_slot = s_p.get("slot", "")
+                is_eligible = (b_pos == s_pos) or (b_pos in FLEX_ELIGIBLE and "FLEX" in s_slot)
+                if is_eligible:
+                    s_lower = s_p.get("projection_lower", 0)
+                    # Both ranges count: bench ceiling vs starter floor
+                    # flagged nearly every pair with ~10-pt-wide bands.
+                    prob = beat_prob(
+                        float(b_p.get("projected_points") or 0), float(b_p.get("projection_lower") or 0), float(b_upper or 0),
+                        float(s_p.get("projected_points") or 0), float(s_lower or 0), float(s_p.get("projection_upper") or 0))
+                    if prob >= TOSS_UP_PROB:
+                        tossups.append({
+                            "bench_player": b_p["player_name"],
+                            "bench_player_id": b_p["player_id"],
+                            "bench_position": b_p["position"],
+                            "bench_projection": b_p["projected_points"],
+                            "bench_upper": b_upper,
+                            "starter_player": s_p["player_name"],
+                            "starter_player_id": s_p["player_id"],
+                            "starter_position": s_p["position"],
+                            "starter_slot": s_slot,
+                            "starter_projection": s_p["projected_points"],
+                            "starter_lower": s_lower,
+                            "diff": round(b_upper - s_lower, 2),
+                            "swap_prob": round(prob, 3),
+                        })
+
+        team_analytics = {
+            "gridiron_value": gridiron_val,
+            "market_value": market_val,
+            "projected_weekly_starter_pts": starter_pts,
+            "total_season_projected_pts": total_season_pts,
+            "position_group_scores": pos_scores,
+            "bye_week_matrix": bye_matrix,
+            "weakest_position": weakest_pos,
+            "start_sit_tossups": tossups,
+        }
+
+        team_entry = {
+            "roster_id": r_id,
+            "user_id": o_id,
+            "owner_id": o_id,
+            "owner_name": disp_name,
+            "display_name": disp_name,
+            "team_name": t_name,
+            "avatar": avatar,
+            "avatar_url": avatar_url,
+            "gridiron_value": gridiron_val,
+            "market_value": market_val,
+            "projected_weekly_starter_pts": starter_pts,
+            "total_season_projected_pts": total_season_pts,
+            "position_group_scores": pos_scores,
+            "weakest_position": weakest_pos,
+        }
+        team_summaries.append(team_entry)
+
+        teams_data_map[str(r_id)] = {
+            "starters": starters,
+            "bench": bench,
+            "reserve": reserve,
+            "team_info": team_info,
+            "team_analytics": team_analytics,
+        }
+
+    # 3. League-Wide Team Power Leaderboard
+    sorted_gridiron = sorted(team_summaries, key=lambda t: t["gridiron_value"], reverse=True)
+    for rk, t in enumerate(sorted_gridiron, 1): t["rank_gridiron"] = rk
+
+    sorted_market = sorted(team_summaries, key=lambda t: t["market_value"], reverse=True)
+    for rk, t in enumerate(sorted_market, 1): t["rank_market"] = rk
+
+    sorted_starter = sorted(team_summaries, key=lambda t: t["projected_weekly_starter_pts"], reverse=True)
+    for rk, t in enumerate(sorted_starter, 1): t["rank_starter_pts"] = rk
+
+    sorted_total = sorted(team_summaries, key=lambda t: t["total_season_projected_pts"], reverse=True)
+    for rk, t in enumerate(sorted_total, 1): t["rank_total_pts"] = rk
+
+    for t in team_summaries:
+        avg_rank = (t["rank_gridiron"] + t["rank_market"] + t["rank_starter_pts"] + t["rank_total_pts"]) / 4.0
+        t["composite_score"] = round(avg_rank, 2)
+
+    sorted_composite = sorted(team_summaries, key=lambda t: t["composite_score"])
+    for rk, t in enumerate(sorted_composite, 1):
+        t["composite_rank"] = rk
+        t["rank"] = rk
+        t["starter_fpts"] = t["projected_weekly_starter_pts"]
+
+    league_leaderboard = sorted_composite
+
+    for str_id, data in teams_data_map.items():
+        r_id = int(str_id)
+        for t in sorted_composite:
+            if t["roster_id"] == r_id:
+                data["team_info"]["rank"] = t["rank"]
+                data["team_info"]["composite_rank"] = t["composite_rank"]
+                data["team_info"]["rank_gridiron"] = t["rank_gridiron"]
+                data["team_info"]["rank_market"] = t["rank_market"]
+                data["team_info"]["rank_starter_pts"] = t["rank_starter_pts"]
+                data["team_analytics"]["rank"] = t["rank"]
+                break
+
+    return teams_data_map, league_leaderboard, rosters, players
+
+class Handler(BaseHTTPRequestHandler):
+    db_path: Path = get_db_path(None)  # overridden in main
+
+    def log_message(self, format, *args):
+        # quiet except errors
+        if self.path.startswith("/hub-api"):
+            print(f"[{self.log_date_time_string()}] {self.command} {self.path}")
+
+    def end_headers(self):
+        origin = self.headers.get("Origin", "")
+        # Allowlist the local Vite dev server on both loopback names.
+        # Omit header for non-allowlisted origins (never emit `null`).
+        if origin in ("http://127.0.0.1:8001", "http://localhost:8001"):
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        # never allow writes
+        if self.command != "GET" and self.command != "OPTIONS":
+            self.send_error(405, "read-only proxy: only GET/OPTIONS")
+            return
+
+        # enforce only /hub-api/* or /health
+        if path == "/health":
+            self.json({"status": "ok", "proxy": "hub read-only", "db": "ok"})
+            return
+
+        if not path.startswith("/hub-api/"):
+            self.send_error(404, "only /hub-api/* and /health")
+            return
+
+        # why per-request league: the UI switcher passes ?league_id= — every
+        # handler below reads that league's own DB file (default/env league
+        # keeps legacy data/fantasy.db). Invalid id -> 400, never a path.
+        # why override first: CLI --db and the test-suite pin Handler.db_path
+        # to a specific file — an explicit pin wins when no ?league_id= is
+        # given (backward compat + hermetic tests).
+        try:
+            league_id = resolve_league_id(qs)
+        except ValueError:
+            self.json({"error": "invalid league_id"}, status=400)
+            return
+        self._league_id = league_id
+        qs_lid = (qs.get("league_id", [None])[0] or "").strip() or None
+        try:
+            if qs_lid:
+                db_path = db_path_for_request(qs_lid)
+            else:
+                override = getattr(self, "db_path", None)
+                db_path = override if override else db_path_for_request(league_id)
+        except ValueError:
+            self.json({"error": "invalid league_id"}, status=400)
+            return
+
+        # draft info is live Sleeper data (no DB needed — setup screen works
+        # before any refresh exists and even when :8000 is down).
+        if path == "/hub-api/draft":
+            try:
+                if not league_id:
+                    self.json({"error": "league_id required — enter your Sleeper league ID first."}, status=400)
+                else:
+                    self.json(get_cached_draft_info(league_id))
+            except Exception as exc:
+                msg = str(exc)
+                if "404" in msg or "Not Found" in msg:
+                    self.json({"error": "League not found on Sleeper — check the league ID."}, status=404)
+                else:
+                    logging.warning("hub proxy: draft fetch failed", exc_info=True)
+                    self.json({"error": "could not reach Sleeper"}, status=502)
+            return
+
+        try:
+            conn = get_conn(db_path)
+        except Exception:
+            # Generic message — never disclose absolute db path; log server-side.
+            logging.warning("hub proxy: cannot open DB read-only", exc_info=True)
+            self.json({"error": "database unavailable"}, status=503)
+            return
+
+        try:
+            if path == "/hub-api/meta":
+                self.handle_meta(conn, qs)
+            elif path == "/hub-api/ready":
+                self.handle_ready(conn)
+            elif path == "/hub-api/projections/ros":
+                self.handle_ros_projections(conn, qs)
+            elif path == "/hub-api/projections":
+                self.handle_projections(conn, qs)
+            elif path == "/hub-api/matchups":
+                self.handle_matchups(conn, qs)
+            elif path == "/hub-api/roster":
+                self.handle_roster(conn, qs)
+            elif path == "/hub-api/rosters-full":
+                self.handle_rosters_full(conn, qs)
+            elif path == "/hub-api/news":
+                self.handle_news(conn)
+            elif path == "/hub-api/refresh-log":
+                self.handle_refresh_log(conn)
+            elif path == "/hub-api/team-ratings":
+                self.handle_ratings(conn)
+            elif path == "/hub-api/waiver":
+                self.handle_waiver(conn)
+            elif path == "/hub-api/trade":
+                self.handle_trade(conn, qs)
+            elif path == "/hub-api/rosters":
+                self.handle_rosters_raw(conn)
+            elif path == "/hub-api/comparison":
+                self.handle_comparison(conn, qs)
+            elif path.startswith("/hub-api/games/predictions") or path.startswith("/hub-api/props/board"):
+                self.proxy_to_model(path.replace("/hub-api", ""), parsed.query)
+            else:
+                self.send_error(404, f"unknown hub-api path {path}")
+        except Exception:
+            logging.exception("proxy error handling %s", path)
+            self.json({"error": "Internal server error"}, status=500)
+        finally:
+            try: conn.close()
+            except: pass
+
+    def json(self, obj, status=200, headers=None):
+        body = json.dumps(obj, indent=2).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        # Consistent caching: no-store by default; callers may override.
+        _extra = dict(headers or {})
+        if "Cache-Control" not in _extra:
+            self.send_header("Cache-Control", "no-store")
+        for k, v in _extra.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def proxy_to_model(self, path, qs):
+        """Forward GET requests to the model API on port 8000."""
+        import urllib.request, urllib.error
+        url = f"http://127.0.0.1:8000{path}"
+        if qs:
+            url += f"?{qs}"
+        try:
+            req = urllib.request.urlopen(url, timeout=15)
+            data = req.read()
+            self.send_response(req.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.json({"error": f"proxy to model failed: {e}"}, status=502)
+
+    # --- handlers ---
+    def handle_meta(self, conn, qs):
+        week = compute_nfl_week()
+        season = datetime.now().year
+        # lastUpdated from successful refresh_log or news
+        last = None
+        row = try_fetch_one(conn, "SELECT ran_at FROM refresh_log WHERE success = 1 ORDER BY ran_at DESC LIMIT 1")
+        if row: last = row["ran_at"]
+        if not last:
+            row = try_fetch_one(conn, "SELECT fetched_at FROM news_data ORDER BY fetched_at DESC LIMIT 1")
+            if row: last = row["fetched_at"]
+
+        # league settings
+        row = try_fetch_one(conn, "SELECT data FROM league_settings ORDER BY season DESC LIMIT 1")
+        data = load_json_blob(row) or {}
+        scoring = data.get("scoring_settings", {})
+        roster_pos = data.get("roster_positions", [])
+
+        # counts
+        counts = {}
+        for tbl in ["team_ratings","sleeper_matchups","player_stats","rosters","news_data","weather"]:
+            r = try_fetch_one(conn, f"SELECT COUNT(*) as c FROM {tbl}")
+            counts[tbl] = r["c"] if r else 0
+
+        # placeholder weather flag (40.0,-74.0 coords are the refresh.py placeholder)
+        weather_placeholder = True
+        r = try_fetch_one(conn, "SELECT lat, lon FROM weather LIMIT 1")
+        if r and not (r["lat"] == 40.0 and r["lon"] == -74.0):
+            weather_placeholder = False
+        weather_status = "placeholder" if weather_placeholder else "live"
+
+        # PERF: fetch blobs directly — never run full build_league_analytics
+        # here just to extract rosters/players (was 12-team enrichment per call).
+        row = try_fetch_one(conn, "SELECT data FROM rosters ORDER BY rowid DESC LIMIT 1")
+        rosters = load_json_blob(row) or []
+        if not isinstance(rosters, list):
+            rosters = []
+        # data_source for frontend banners: demo when player_stats empty/seeded.
+        data_source = "live"
+        try:
+            has_players = False
+            try:
+                prow = try_fetch_one(conn, "SELECT data FROM player_stats WHERE json_array_length(data)>0 ORDER BY rowid DESC LIMIT 1")
+                pdata = load_json_blob(prow) if prow else None
+                if isinstance(pdata, list) and len(pdata) > 0:
+                    has_players = True
+                else:
+                    for cand in conn.execute("SELECT data FROM player_stats ORDER BY rowid DESC LIMIT 10").fetchall():
+                        d = load_json_blob(cand)
+                        if isinstance(d, list) and len(d) > 0:
+                            has_players = True
+                            break
+            except Exception:
+                pass
+            if not has_players:
+                data_source = "demo"
+            else:
+                srow = try_fetch_one(conn, "SELECT source FROM refresh_log ORDER BY ran_at DESC LIMIT 1")
+                if srow:
+                    try:
+                        src = (srow["source"] or "").lower()
+                    except Exception:
+                        src = ""
+                    if "demo" in src or "seed" in src:
+                        data_source = "demo"
+        except Exception:
+            pass
+        teams = []
+        users_map = get_sleeper_users(conn, self._league_id)
+        for r in (rosters if isinstance(rosters, list) else []):
+            if not isinstance(r, dict): continue
+            r_id = r.get("roster_id")
+            o_id = str(r.get("owner_id") or "")
+            u_info = users_map.get(o_id, {})
+            owner_name = u_info.get("display_name") or u_info.get("team_name") or f"Team {r_id}"
+            teams.append({
+                "roster_id": r_id,
+                "user_id": o_id,
+                "owner_name": owner_name,
+                "avatar": u_info.get("avatar"),
+            })
+        # Serve last cached leaderboard when fresh; never trigger a full build here.
+        league_leaderboard = []
+        try:
+            with _CACHE_LOCK:
+                _cached_full = _ROSTERS_FULL_CACHE.get("payload")
+                _cached_at = _ROSTERS_FULL_CACHE.get("at", 0.0)
+                if _cached_full is not None and (time.time() - _cached_at < _ROSTERS_FULL_TTL):
+                    league_leaderboard = _cached_full.get("league_leaderboard") or []
+        except Exception:
+            league_leaderboard = []
+
+        self.json({
+            "season": data.get("season") or season,
+            "week": week,
+            "leagueName": data.get("name") or data.get("league_name") or "Fantasy Bahamas",
+            # why resolved-not-hardcoded: multi-league — the id comes from
+            # ?league_id= (or env); the old literal leaked a private league.
+            "leagueId": data.get("league_id") or self._league_id or default_league_id(),
+            "defaultLeagueId": default_league_id(),
+            "configuredLeagues": list_configured_leagues(),
+            "totalRosters": data.get("total_rosters", 12),
+            "lastUpdated": last,
+            "last_updated": last,
+            "scoring_settings": scoring,
+            "roster_positions": roster_pos,
+            "counts": counts,
+            "teams": teams,
+            "weather_placeholder": weather_placeholder,
+            "weather_status": weather_status,
+            "data_source": data_source,
+            "league_leaderboard": league_leaderboard,
+        })
+
+    def handle_ready(self, conn):
+        # Readiness (model has /ready; proxy mirrors it): 200 when DB present
+        # + fresh-ish (rosters + player_stats non-empty), 503 otherwise.
+        try:
+            rrow = try_fetch_one(conn, "SELECT data FROM rosters ORDER BY rowid DESC LIMIT 1")
+            rosters = load_json_blob(rrow) or []
+            has_rosters = isinstance(rosters, list) and len(rosters) > 0
+        except Exception:
+            has_rosters = False
+        try:
+            has_players = False
+            try:
+                prow = try_fetch_one(conn, "SELECT data FROM player_stats WHERE json_array_length(data)>0 ORDER BY rowid DESC LIMIT 1")
+                pdata = load_json_blob(prow) if prow else None
+                if isinstance(pdata, list) and len(pdata) > 0:
+                    has_players = True
+                else:
+                    for cand in conn.execute("SELECT data FROM player_stats ORDER BY rowid DESC LIMIT 10").fetchall():
+                        d = load_json_blob(cand)
+                        if isinstance(d, list) and len(d) > 0:
+                            has_players = True
+                            break
+            except Exception:
+                pass
+        except Exception:
+            has_players = False
+        if has_rosters and has_players:
+            self.json({"status": "ready"})
+        else:
+            self.json({"error": "not ready: database empty or missing"}, status=503)
+
+    def handle_ros_projections(self, conn, qs):
+        try:
+            row = conn.execute(
+                "SELECT season FROM ros_projections ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                self.json({"players": [], "count": 0})
+                return
+            season = row[0]
+            rows = conn.execute(
+                "SELECT player_id, player_name, position, team, ros_points, "
+                "remaining_games, per_game_neutral FROM ros_projections "
+                "WHERE season = ? ORDER BY ros_points DESC",
+                (season,),
+            ).fetchall()
+            players = [dict(r) for r in rows]
+            self.json({"players": players, "count": len(players)})
+        except Exception as e:
+            self.json({"error": str(e)}, status=500)
+
+    def handle_weekly_projection(self, conn, qs, week: int):
+        # Independent per-week projection (own opponent/vegas/weather) for
+        # a week other than "current" — reads weekly_projections, populated
+        # during refresh from compute_ros_projections' per-week breakdown.
+        # Sibling to handle_projections but never falls back to the
+        # season-average aggregation: a week with no stored rows yet
+        # (beyond the precomputed current..18 horizon, or before the first
+        # refresh after this feature shipped) returns an empty list rather
+        # than silently substituting the wrong week's snapshot.
+        try:
+            season_row = try_fetch_one(
+                conn, "SELECT season FROM weekly_projections ORDER BY season DESC LIMIT 1"
+            )
+            if not season_row:
+                self.json({"players": [], "count": 0, "meta": {"source": "none", "week": week}})
+                return
+            season = season_row[0]
+            rows = conn.execute(
+                "SELECT player_id, player_name, position, team, opponent_team, "
+                "projected_points, projection_lower, projection_upper, width, wind_mph "
+                "FROM weekly_projections WHERE season = ? AND week = ? "
+                "ORDER BY projected_points DESC",
+                (season, week),
+            ).fetchall()
+        except Exception as e:
+            self.json({"error": str(e)}, status=500)
+            return
+
+        injuries_row = try_fetch_one(conn, "SELECT data FROM injury_status ORDER BY season DESC LIMIT 1")
+        injuries = load_json_blob(injuries_row) or {}
+        _sleeper_players = get_sleeper_players_cached()
+        gsis_to_sleeper, gsis_to_espn = {}, {}
+        for sid, sp in (_sleeper_players.items() if isinstance(_sleeper_players, dict) else []):
+            if not isinstance(sp, dict):
+                continue
+            g = sp.get("gsis_id")
+            gs = str(g).strip() if g else ""
+            if not gs:
+                continue
+            gsis_to_sleeper[gs] = str(sid)
+            e = sp.get("espn_id")
+            es = str(e).strip() if e else ""
+            if es:
+                gsis_to_espn[gs] = es
+
+        limit = 800
+        try:
+            if qs.get("limit", [None])[0]:
+                limit = max(10, min(2000, int(qs.get("limit")[0])))
+        except Exception:
+            pass
+
+        players = []
+        for r in rows:
+            pid = str(r["player_id"])
+            pts = float(r["projected_points"] or 0)
+            _lo, _hi = interval_bounds(pts, r["position"])
+            low = float(r["projection_lower"]) if r["projection_lower"] is not None else _lo
+            high = float(r["projection_upper"]) if r["projection_upper"] is not None else _hi
+            width = float(r["width"]) if r["width"] is not None else round((high - low) / 2, 2)
+            sleeper_id = gsis_to_sleeper.get(pid) or (pid if pid.isdigit() else None)
+            players.append({
+                "player_id": pid,
+                "sleeper_id": sleeper_id,
+                "espn_id": gsis_to_espn.get(pid),
+                "player_name": r["player_name"],
+                "position": r["position"],
+                "position_group": r["position"],
+                "team": r["team"],
+                "opponent_team": r["opponent_team"] or "",
+                "projected_points": round(pts, 2),
+                "point_estimate": round(pts, 2),
+                "projection_lower": round(low, 2),
+                "projection_upper": round(high, 2),
+                "lower_bound": round(low, 2),
+                "upper_bound": round(high, 2),
+                "width": round(width, 2),
+                "projection_width": round(width, 2),
+                "injury_status": injuries.get(pid),
+                "trending": False,
+                "wind_mph": r["wind_mph"],
+                "weather_delta": 0,
+                "games": 1,
+            })
+        sliced = players[:limit]
+        self.json({
+            "players": sliced,
+            "count": len(sliced),
+            "meta": {"source": "db:weekly_projections", "week": week, "season": season},
+        })
+
+    def handle_projections(self, conn, qs):
+        # Explicit ?week=N for a week other than "current" reads the
+        # weekly_projections table (independent per-week model output —
+        # own opponent/vegas/weather, see stat_projector.build_weekly_
+        # projections) instead of the season-average snapshot below.
+        # Bypasses the 60s cache (keyed for the no-week default case only)
+        # since a per-week DB read is a cheap indexed (season, week) lookup.
+        _cw_for_week = compute_nfl_week()
+        _req_week_raw = qs.get("week", [None])[0]
+        try:
+            _req_week = int(_req_week_raw) if _req_week_raw not in (None, "") else None
+        except Exception:
+            _req_week = None
+        if _req_week is not None and _req_week != _cw_for_week:
+            self.handle_weekly_projection(conn, qs, _req_week)
+            return
+        # 60s server-side cache + Last-Modified/304 mirroring rosters-full.
+        global _PROJECTIONS_CACHE
+        _now = time.time()
+        with _CACHE_LOCK:
+            _pcached = _PROJECTIONS_CACHE.get("payload")
+            _pat = _PROJECTIONS_CACHE.get("at", 0.0)
+            _plm = _PROJECTIONS_CACHE.get("last_modified", "")
+            if _pcached is not None and (_now - _pat < _PROJECTIONS_TTL):
+                _ims = self.headers.get("If-Modified-Since")
+                if _ims and _plm and _ims == _plm:
+                    self.send_response(304)
+                    self.send_header("Cache-Control", "private, max-age=60")
+                    self.send_header("Last-Modified", _plm)
+                    self.end_headers()
+                    return
+                _limit0 = 800
+                try:
+                    if qs.get("limit", [None])[0]:
+                        _limit0 = max(10, min(2000, int(qs.get("limit")[0])))
+                except Exception:
+                    pass
+                _full0 = _pcached.get("players_full") or []
+                _nf0 = _pcached.get("num_flex", 2)
+                _sliced0 = _full0[:_limit0]
+                self.json({"players": _sliced0, "count": len(_sliced0), "meta": {"source": "db:player_stats:averaged", "num_flex": _nf0, "week": _cw_for_week}}, headers={"Cache-Control": "private, max-age=60", "Last-Modified": _plm})
+                return
+        # Load player_stats blob (latest non-empty — preseason week 0 is often "[]"; also handle invalid JSON with NaN)
+        # Prefer SQL json_array_length>0 but fall back to Python scan if SQLite JSON is invalid (NaN)
+        # why week <= current: stale future-week blobs (e.g. legacy week-10 demo
+        # seed) otherwise shadow real data via season/week DESC ordering.
+        # Audit 22.0: sort by week DESC (not rowid DESC) so week=1 is preferred
+        # over week=0 when both exist — week=0 is the preseason baseline cache
+        # and week=current has actual game data.
+        row = None
+        _cw = compute_nfl_week()
+        try:
+            row = try_fetch_one(conn, "SELECT data FROM player_stats WHERE json_array_length(data)>0 AND week <= ? ORDER BY season DESC, week DESC, rowid DESC LIMIT 1", (_cw,))
+        except: row = None
+        if not row or not load_json_blob(row):
+            # Python fallback: scan recent rows for first non-empty list
+            try:
+                for cand in conn.execute("SELECT data, season, week FROM player_stats ORDER BY season DESC, week DESC, rowid DESC LIMIT 10").fetchall():
+                    if cand["week"] is not None and int(cand["week"]) > _cw:
+                        continue
+                    data = load_json_blob(cand)
+                    if isinstance(data, list) and len(data) > 10:
+                        row = cand
+                        break
+            except: pass
+        if not row:
+            row = try_fetch_one(conn, "SELECT data FROM player_stats ORDER BY season DESC, rowid DESC LIMIT 1")
+        players = load_json_blob(row) or []
+        if not isinstance(players, list):
+            players = []
+
+        # league context for flex
+        row = try_fetch_one(conn, "SELECT data FROM league_settings ORDER BY season DESC LIMIT 1")
+        league = load_json_blob(row) or {}
+        scoring = league.get("scoring_settings", DEFAULT_SCORING)
+        roster_pos = league.get("roster_positions", ["QB","RB","RB","WR","WR","TE","FLEX","FLEX","K","DEF","BN","BN","BN","BN","IR","IR"])
+        num_flex = count_flex_slots(roster_pos)
+
+        # injury map
+        row = try_fetch_one(conn, "SELECT data FROM injury_status ORDER BY season DESC LIMIT 1")
+        injuries = load_json_blob(row) or {}
+        # trending set
+        trending_ids = set()
+        row = try_fetch_one(conn, "SELECT data FROM news_data WHERE kind='trending' ORDER BY fetched_at DESC LIMIT 1")
+        trending = load_json_blob(row) or []
+        for t in trending if isinstance(trending, list) else []:
+            if isinstance(t, dict) and t.get("player_id"):
+                trending_ids.add(str(t["player_id"]))
+
+        # Aggregate multi-week data into per-player season averages.
+        # nflreadpy stores one row per player per week — raw blob has ~19k rows.
+        # Without aggregation we'd show a single arbitrary week, not projections.
+        agg = {}
+        for p in players:
+            pid = str(p.get("player_id") or p.get("id") or "")
+            if not pid:
+                continue
+            pts = _calc_points_from_raw(p, scoring)
+            if pid not in agg:
+                agg[pid] = {
+                    "player_id": pid,
+                    "player_name": p.get("player_display_name") or p.get("short_name") or p.get("player_name") or pid,
+                    "position": (p.get("position") or p.get("position_group") or "UNK").upper(),
+                    # nflverse quirk: prefer `team` over `recent_team` for abbrev.
+                    "team": p.get("team") or p.get("recent_team") or "",
+                    "opponent_team": p.get("opponent_team") or "",
+                    "total_pts": 0.0,
+                    "games": 0,
+                    "week_pts": [],
+                    # why track this (user-caught live bug, 2026-09-10): the
+                    # model explicitly flags a rookie/no-history player as
+                    # is_empty_projection=True, projected_points=0.0 — honest
+                    # "unknown", the same discipline stat_projector.py's own
+                    # "tested and REJECTED imputing positional mean" comment
+                    # documents. Without tracking this, the priority chain
+                    # below fell through model->raw_pts->market and silently
+                    # showed a FantasyPros market guess as if it were the
+                    # model's number for players the model explicitly said it
+                    # couldn't project (confirmed live: 4 real rookies with
+                    # is_empty_projection=True showed 6.28/5.01/0.61/1.46).
+                    "is_empty": bool(p.get("is_empty_projection")),
+                }
+            agg[pid]["total_pts"] += pts
+            agg[pid]["games"] += 1
+            agg[pid]["week_pts"].append(pts)
+            if p.get("is_empty_projection"):
+                agg[pid]["is_empty"] = True
+            # nflverse quirk: prefer `team` over `recent_team`.
+            if p.get("team"):
+                agg[pid]["team"] = p["team"]
+            elif p.get("recent_team"):
+                agg[pid]["team"] = p["recent_team"]
+
+        comp_row = try_fetch_one(conn, "SELECT data FROM market_consensus ORDER BY fetched_at DESC LIMIT 1")
+        comp_list = load_json_blob(comp_row, key="data") or []
+        comp_by_id = {}
+        for c in (comp_list if isinstance(comp_list, list) else []):
+            if isinstance(c, dict) and c.get("player_id"):
+                comp_by_id[str(c["player_id"])] = c
+
+        # Sleeper cache via startup-warmed TTL (never holds _CACHE_LOCK across I/O).
+        _sleeper_players = get_sleeper_players_cached()
+
+        gsis_to_sleeper = {}
+        name_team_pos_to_sleeper = {}
+        gsis_to_espn = {}
+        name_team_pos_to_espn = {}
+        # why team-agnostic tier: nflverse blobs go stale on trades/FA moves
+        # ("Kenneth Walker" SEA in 2025 blob vs KC live) and Sleeper lists
+        # free agents with team=None — exact-team match misses both, but the
+        # photo follows the person, not the team. Built preferring entries
+        # WITH a team so same-name collisions resolve to a rostered player.
+        name_pos_to_sleeper = {}
+        name_pos_to_espn = {}
+        for sid, sp in (_sleeper_players.items() if isinstance(_sleeper_players, dict) else []):
+            if not isinstance(sp, dict):
+                continue
+            g = sp.get("gsis_id")
+            gs = str(g).strip() if g else ""
+            if gs: gsis_to_sleeper[gs] = str(sid)
+            # why espn second map: Sleeper CDN thumbs need a numeric sleeper_id,
+            # but only ~1/3 of /players/nfl entries carry gsis_id while nearly
+            # all carry espn_id — espn_id feeds the ESPN-headshot fallback in
+            # playerAvatar.js (espncdn is allowlisted in escape.js).
+            # why strip: Sleeper ships ~866 gsis_ids with a leading space
+            # (' 00-0035100'); unstripped keys never match nflverse pids.
+            e = sp.get("espn_id")
+            es = str(e).strip() if e else ""
+            if gs and es: gsis_to_espn[gs] = es
+            # Also build name+team+pos -> sleeper_id for fallback lookup
+            # why _norm_n (not .lower()): Sleeper strips suffixes
+            # ("Michael Penix") while nflverse keeps them ("Michael Penix Jr.");
+            # raw lower() never matches suffix players.
+            nm = _norm_n(sp.get("full_name") or f"{sp.get('first_name','')} {sp.get('last_name','')}".strip())
+            tm = (sp.get("team") or "").upper()
+            ps = (sp.get("position") or "").upper()
+            # why FB->RB: Sleeper tags fullbacks FB, nflverse tags them RB —
+            # without this Hunter Luepke (DAL starter) never matches.
+            if ps == "FB":
+                ps = "RB"
+            if nm and tm and ps:
+                name_team_pos_to_sleeper[(nm, tm, ps)] = str(sid)
+                if es: name_team_pos_to_espn[(nm, tm, ps)] = es
+            if nm and ps:
+                if tm and (nm, ps) not in name_pos_to_sleeper:
+                    name_pos_to_sleeper[(nm, ps)] = str(sid)
+                    if es: name_pos_to_espn[(nm, ps)] = es
+                elif not tm:
+                    name_pos_to_sleeper.setdefault((nm, ps), str(sid))
+                    if es: name_pos_to_espn.setdefault((nm, ps), es)
+
+        # PERF: compute once per request — never per-player.
+        _opp_map = get_nfl_opponent_map(compute_nfl_week())
+        # Live weather for default projections: same STADIUM_COORDS+weather
+        # join as matchups handler, but keyed by opponent_team for O(1) lookup.
+        _wx_by_team = {}
+        try:
+            _wx_raw = {}
+            for w in conn.execute(
+                "SELECT lat, lon, wind_mph FROM weather ORDER BY fetched_at DESC"
+            ).fetchall():
+                key = (round(float(w["lat"]), 4), round(float(w["lon"]), 4))
+                if key not in _wx_raw:
+                    _wx_raw[key] = float(w["wind_mph"]) if w["wind_mph"] is not None else 0
+            for tm, coords in STADIUM_COORDS.items():
+                k = (round(coords[0], 4), round(coords[1], 4))
+                if k in _wx_raw:
+                    _wx_by_team[tm] = _wx_raw[k]
+        except Exception:
+            _wx_by_team = {}
+
+        out = []
+        for pid, a in agg.items():
+            if a["games"] == 0:
+                continue
+            pos = a["position"]
+            raw_pts = apply_flex_adjustment(a["total_pts"] / a["games"], pos, num_flex)
+            comp = comp_by_id.get(pid) or comp_by_id.get(gsis_to_sleeper.get(pid, "")) or {}
+            m_pts = comp.get("model_points")
+            mk_s = comp.get("market_season_points")
+            mk_per_game = round(float(mk_s) / 17.0, 2) if (mk_s is not None and float(mk_s) > 0) else None
+
+            if m_pts is not None and float(m_pts) > 0:
+                pts = float(m_pts)
+            elif a.get("is_empty"):
+                # why stop here, not fall through (user-caught live bug):
+                # the model explicitly couldn't project this player (no
+                # history — rookie, or returning from injury with nothing
+                # to average). raw_pts is 0 for the same reason and would
+                # never have been shown anyway; the real risk was falling
+                # through further to mk_per_game (a FantasyPros market
+                # guess) and displaying that as if it were this app's own
+                # projection. Show 0/unknown instead, same honesty rule
+                # stat_projector.py's "explicit zero + flag" already follows.
+                pts = 0.0
+            elif raw_pts > 0:
+                pts = raw_pts
+            elif mk_per_game and mk_per_game > 0:
+                pts = mk_per_game
+            else:
+                pts = 0.0
+
+            low, high = interval_bounds(pts, pos)
+            width = round((high - low) / 2, 2)
+            # Try GSIS map first, then name+team+pos lookup against Sleeper cache
+            # why _norm_n: matches the normalized build side (suffix-proof).
+            sleeper_id = gsis_to_sleeper.get(pid)
+            if not sleeper_id:
+                nm = _norm_n(a["player_name"] or "")
+                tm = (a["team"] or "").upper()
+                ps = (pos or "").upper()
+                if nm and tm and ps:
+                    sleeper_id = name_team_pos_to_sleeper.get((nm, tm, ps))
+                if not sleeper_id and nm and ps:
+                    sleeper_id = name_pos_to_sleeper.get((nm, ps))
+            # ESPN fallback chain mirrors the sleeper one (feeds playerAvatar's
+            # espncdn fallback for players with no gsis_id / name mismatch).
+            espn_id = gsis_to_espn.get(pid)
+            if not espn_id:
+                nm = _norm_n(a["player_name"] or "")
+                tm = (a["team"] or "").upper()
+                ps = (pos or "").upper()
+                if nm and tm and ps:
+                    espn_id = name_team_pos_to_espn.get((nm, tm, ps))
+                if not espn_id and nm and ps:
+                    espn_id = name_pos_to_espn.get((nm, ps))
+
+            out.append({
+                "player_id": pid,
+                "sleeper_id": sleeper_id if sleeper_id else (pid if pid.isdigit() else None),
+                "espn_id": espn_id,
+                "player_name": a["player_name"],
+                "position": pos,
+                "position_group": pos,
+                "team": a["team"],
+                "opponent_team": _opp_map.get(a["team"]) or a["opponent_team"] or "",
+                "projected_points": round(pts, 2),
+                "point_estimate": round(pts, 2),
+                "projection_lower": round(low, 2),
+                "projection_upper": round(high, 2),
+                "lower_bound": round(low, 2),
+                "upper_bound": round(high, 2),
+                "width": width,
+                "projection_width": width,
+                "injury_status": injuries.get(pid),
+                "trending": pid in trending_ids,
+                "wind_mph": _wx_by_team.get(_opp_map.get(a["team"]) or a["opponent_team"] or "", 0),
+                "weather_delta": 0,
+                "games": a["games"],
+            })
+        out.sort(key=lambda x: x["projected_points"], reverse=True)
+        _last_modified = formatdate(timeval=_now, localtime=False, usegmt=True)
+        with _CACHE_LOCK:
+            _PROJECTIONS_CACHE = {"at": _now, "payload": {"players_full": out, "num_flex": num_flex}, "last_modified": _last_modified}
+        # ?limit support (default 800 for UI, max 2000 to bound payload).
+        limit = 800
+        try:
+            if qs.get("limit", [None])[0]:
+                limit = max(10, min(2000, int(qs.get("limit")[0])))
+        except Exception:
+            pass
+        sliced = out[:limit]
+        self.json({"players": sliced, "count": len(sliced), "meta": {"source": "db:player_stats:averaged", "num_flex": num_flex, "week": _cw_for_week}}, headers={"Cache-Control": "private, max-age=60", "Last-Modified": _last_modified})
+
+    def handle_matchups(self, conn, qs):
+        week_vals = qs.get("week", [None])[0]
+        week = int(week_vals) if week_vals and week_vals.isdigit() else None
+        if week is None:
+            week = compute_nfl_week()
+            if week == 0:
+                week = None
+        league_rows = []
+        try:
+            if week is not None:
+                league_rows = conn.execute("SELECT season, week, roster_id, matchup_id, points, starters FROM sleeper_matchups WHERE week = ? ORDER BY matchup_id, roster_id", (week,)).fetchall()
+            else:
+                league_rows = conn.execute("SELECT season, week, roster_id, matchup_id, points, starters FROM sleeper_matchups ORDER BY week DESC, matchup_id LIMIT 50").fetchall()
+        except Exception:
+            league_rows = []
+        league = []
+        for r in league_rows:
+            starters = []
+            try: starters = json.loads(r["starters"]) if r["starters"] else []
+            except: starters = []
+            league.append({"season": r["season"], "week": r["week"], "roster_id": r["roster_id"], "matchup_id": r["matchup_id"], "points": r["points"], "starters": starters})
+
+        # Load real NFL slate for the target week
+        nfl_slate = []
+        target_wk = week if (week and week > 0) else 1
+        # Live forecast join: latest weather row per stadium. Schedule
+        # wind/temp are observed post-game (null before kickoff), so without
+        # this the slate shows wind 0 all preseason despite live rows.
+        wx_by_stadium = {}
+        try:
+            for w in conn.execute(
+                "SELECT lat, lon, temp_f, wind_mph, precip_prob, fetched_at FROM weather ORDER BY fetched_at DESC"
+            ).fetchall():
+                key = (round(float(w["lat"]), 4), round(float(w["lon"]), 4))
+                if key not in wx_by_stadium:
+                    wx_by_stadium[key] = w
+        except Exception:
+            wx_by_stadium = {}
+        repo_root = Path(__file__).resolve().parent.parent
+        sched_file = repo_root / "data" / "nfl_cache" / "schedule_2026.json"
+        if not sched_file.exists():
+            sched_file = repo_root / "data" / "nfl_cache" / "schedule_2025.json"
+        if sched_file.exists():
+            try:
+                with open(sched_file) as f:
+                    sched_data = json.load(f)
+                games = [g for g in sched_data if g.get("week") == target_wk]
+                for g in games:
+                    home = g.get("home_team", "")
+                    wind_mph = float(g.get("wind") or 0)
+                    temp_f = g.get("temp")
+                    precip_prob = 0
+                    wx_source = "schedule"
+                    coords = STADIUM_COORDS.get(home)
+                    if coords:
+                        w = wx_by_stadium.get((round(coords[0], 4), round(coords[1], 4)))
+                        if w is not None:
+                            try:
+                                wind_mph = float(w["wind_mph"] if w["wind_mph"] is not None else wind_mph)
+                                temp_f = float(w["temp_f"]) if w["temp_f"] is not None else temp_f
+                                precip_prob = float(w["precip_prob"] or 0)
+                                wx_source = "forecast"
+                            except Exception:
+                                pass
+                    nfl_slate.append({
+                        "home_team": home or "—",
+                        "away_team": g.get("away_team", "—"),
+                        "stadium": g.get("stadium") or "Stadium",
+                        "gameday": g.get("gameday") or "",
+                        "gametime": g.get("gametime") or "",
+                        "wind_mph": wind_mph,
+                        "temp_f": temp_f,
+                        "precip_prob": precip_prob,
+                        "weather_source": wx_source,
+                        "spread_line": g.get("spread_line"),
+                        "total_line": g.get("total_line"),
+                        "placeholder": False,
+                    })
+            except Exception as e:
+                print(f"Failed to load nfl_slate: {e}")
+
+        self.json({"leagueMatchups": league, "nflSlate": nfl_slate, "week": target_wk})
+
+    def handle_roster(self, conn, qs):
+        teams_data_map, league_leaderboard, rosters, players = build_league_analytics(conn, self._league_id)
+        users_map = get_sleeper_users(conn, self._league_id)
+
+        # Build list of 12 league rosters summary (allTeams)
+        all_teams = []
+        for r in (rosters if isinstance(rosters, list) else []):
+            if not isinstance(r, dict): continue
+            r_id = r.get("roster_id")
+            o_id = str(r.get("owner_id") or "")
+            u_info = users_map.get(o_id, {})
+            disp_name = u_info.get("display_name") or u_info.get("team_name") or f"Team {r_id}"
+            t_name = u_info.get("team_name") or u_info.get("display_name") or f"Team {r_id}"
+            all_teams.append({
+                "roster_id": r_id,
+                "user_id": o_id,
+                "owner_id": o_id,
+                "owner_name": disp_name,
+                "display_name": disp_name,
+                "team_name": t_name,
+                "avatar": u_info.get("avatar"),
+                "avatar_url": u_info.get("avatar_url"),
+                "players_count": len(r.get("players") or []),
+            })
+
+        # Target roster selection: ?roster_id=N or ?owner_id=X. Default to roster_id=1.
+        # NOTE: server default stays 1; client derives the actual selection from
+        # leagueRosters/allTeams (see hub/src roster picker).
+        req_roster_id = (qs.get("roster_id", [None])[0] or "").strip()
+        req_owner_id = (qs.get("owner_id", [None])[0] or "").strip()
+
+        target_roster_id = "1"
+        if req_roster_id:
+            target_roster_id = req_roster_id
+        elif req_owner_id:
+            for r in (rosters if isinstance(rosters, list) else []):
+                if isinstance(r, dict) and str(r.get("owner_id") or "").lower() == req_owner_id.lower():
+                    target_roster_id = str(r.get("roster_id"))
+                    break
+
+        if target_roster_id not in teams_data_map and teams_data_map:
+            target_roster_id = list(teams_data_map.keys())[0]
+
+        target_data = teams_data_map.get(target_roster_id, {
+            "starters": [], "bench": [], "reserve": [],
+            "team_info": {}, "team_analytics": {}
+        })
+
+        self.json({
+            "starters": target_data["starters"],
+            "bench": target_data["bench"],
+            "reserve": target_data["reserve"],
+            "myRoster": target_data["starters"],
+            "team_info": target_data["team_info"],
+            "teamMeta": target_data["team_info"],
+            "allTeams": all_teams,
+            "leagueRosters": all_teams,
+            "team_analytics": target_data["team_analytics"],
+            "teamSummary": target_data["team_analytics"],
+            "league_leaderboard": league_leaderboard,
+            "team_leaderboard": league_leaderboard,
+            "meta": {"rosters": len(rosters), "players": len(players)}
+        })
+
+    def handle_news(self, conn):
+        trending = []
+        injuries = []
+        row = try_fetch_one(conn, "SELECT data FROM news_data WHERE kind='trending' ORDER BY fetched_at DESC LIMIT 1")
+        trending = load_json_blob(row) or []
+        row = try_fetch_one(conn, "SELECT data FROM news_data WHERE kind='injuries' ORDER BY fetched_at DESC LIMIT 1")
+        injuries = load_json_blob(row) or []
+        row = try_fetch_one(conn, "SELECT data FROM news_data WHERE kind='fantasypros_news' ORDER BY fetched_at DESC LIMIT 1")
+        fp_news = load_json_blob(row) or []
+
+        # Map player_id -> player_name using player_stats in DB
+        pmap = {}
+        try:
+            r = try_fetch_one(conn, "SELECT data FROM player_stats ORDER BY season DESC, rowid DESC LIMIT 1")
+            p_data = load_json_blob(r) or []
+            for p in p_data if isinstance(p_data, list) else []:
+                pid = str(p.get("player_id") or p.get("id") or "")
+                nm = p.get("player_display_name") or p.get("short_name")
+                pos = (p.get("position") or "").upper()
+                if pid and nm:
+                    pmap[pid] = f"{nm} ({pos})" if pos else nm
+        except Exception:
+            pass
+
+        enriched_trending = []
+        for t in trending if isinstance(trending, list) else []:
+            if isinstance(t, dict):
+                pid = str(t.get("player_id") or "")
+                t_name = t.get("player_name") or pmap.get(pid)
+                if not t_name or t_name == pid or t_name.isdigit():
+                    t_name = get_sleeper_player_name(pid)
+                enriched_trending.append({**t, "player_name": t_name})
+            else:
+                enriched_trending.append(t)
+
+        self.json({
+            "trending_adds": enriched_trending,
+            "detailed_injuries": injuries if isinstance(injuries, list) else [],
+            "fantasypros_news": fp_news if isinstance(fp_news, list) else [],
+        })
+
+    def handle_refresh_log(self, conn):
+        rows = []
+        try:
+            rows = conn.execute("SELECT source, ran_at, success, error_message FROM refresh_log ORDER BY ran_at DESC LIMIT 20").fetchall()
+        except: pass
+        self.json({"entries": [dict(r) for r in rows]})
+
+    def handle_ratings(self, conn):
+        rows = []
+        try:
+            rows = conn.execute("SELECT team, position_group, rating, rating_deviation, last_updated_week, season FROM team_ratings ORDER BY team, position_group LIMIT 100").fetchall()
+        except: pass
+        self.json({"ratings": [dict(r) for r in rows]})
+
+    def handle_rosters_raw(self, conn):
+        row = try_fetch_one(conn, "SELECT data FROM rosters ORDER BY rowid DESC LIMIT 1")
+        data = load_json_blob(row) or []
+        self.json({"rosters": data})
+
+    def handle_rosters_full(self, conn, qs):
+        # ONE build_league_analytics pass for all 12 enriched rosters (fixes N+1).
+        # 60s server-side cache + Last-Modified; clients may use If-Modified-Since.
+        # Cache is keyed for the default "current week" case only — an
+        # explicit ?week=N for a different week (Matchups week picker)
+        # bypasses it so per-week starter points aren't served stale from
+        # whatever week last populated the cache.
+        week_vals = qs.get("week", [None])[0]
+        req_week = int(week_vals) if week_vals and week_vals.isdigit() else None
+        global _ROSTERS_FULL_CACHE
+        now = time.time()
+        if req_week is None:
+            with _CACHE_LOCK:
+                cached = _ROSTERS_FULL_CACHE.get("payload")
+                at = _ROSTERS_FULL_CACHE.get("at", 0.0)
+                lm = _ROSTERS_FULL_CACHE.get("last_modified", "")
+                if cached is not None and (now - at < _ROSTERS_FULL_TTL):
+                    ims = self.headers.get("If-Modified-Since")
+                    if ims and lm and ims == lm:
+                        self.send_response(304)
+                        self.send_header("Cache-Control", "private, max-age=60")
+                        self.send_header("Last-Modified", lm)
+                        self.end_headers()
+                        return
+                    self.json(cached, headers={"Cache-Control": "private, max-age=60", "Last-Modified": lm})
+                    return
+        teams_data_map, league_leaderboard, rosters, players = build_league_analytics(conn, self._league_id, week=req_week)
+        users_map = get_sleeper_users(conn, self._league_id)
+        # Power + records for the dashboard playoff race. Sleeper roster
+        # rows carry W/L/FP; weekly starter projections come from the
+        # leaderboard built in the same analytics pass (matchup-adjusted).
+        power = {}
+        for t in (league_leaderboard if isinstance(league_leaderboard, list) else []):
+            if isinstance(t, dict) and t.get("roster_id") is not None:
+                power[str(t.get("roster_id"))] = t.get("projected_weekly_starter_pts") or 0
+        try:
+            lg_row = try_fetch_one(conn, "SELECT data FROM league_settings ORDER BY season DESC LIMIT 1")
+            lg = load_json_blob(lg_row) or {}
+            lg_settings = lg.get("settings") or {}
+        except Exception:
+            lg_settings = {}
+        all_teams = []
+        for r in (rosters if isinstance(rosters, list) else []):
+            if not isinstance(r, dict):
+                continue
+            r_id = r.get("roster_id")
+            o_id = str(r.get("owner_id") or "")
+            u_info = users_map.get(o_id, {})
+            disp_name = u_info.get("display_name") or u_info.get("team_name") or f"Team {r_id}"
+            t_name = u_info.get("team_name") or u_info.get("display_name") or f"Team {r_id}"
+            # why nested settings: Sleeper nests W/L/FP under roster.settings,
+            # not top-level — top-level .get() silently yielded 0–0 forever.
+            rs = r.get("settings") or {}
+            _fp = r.get("fpts") if r.get("fpts") is not None else rs.get("fpts", 0)
+            _fpd = r.get("fpts_decimal") if r.get("fpts_decimal") is not None else rs.get("fpts_decimal", 0)
+            all_teams.append({
+                "roster_id": r_id,
+                "user_id": o_id,
+                "owner_id": o_id,
+                "owner_name": disp_name,
+                "display_name": disp_name,
+                "team_name": t_name,
+                "avatar": u_info.get("avatar"),
+                "avatar_url": u_info.get("avatar_url"),
+                "players_count": len(r.get("players") or []),
+                "wins": r.get("wins") if r.get("wins") is not None else rs.get("wins", 0),
+                "losses": r.get("losses") if r.get("losses") is not None else rs.get("losses", 0),
+                "ties": r.get("ties") if r.get("ties") is not None else rs.get("ties", 0),
+                "fpts": (float(_fp or 0) + float(_fpd or 0) / 100.0),
+                "starter_pts": round(float(power.get(str(r_id), 0) or 0), 1),
+            })
+        payload = {
+            "rosters": teams_data_map,
+            "league_leaderboard": league_leaderboard,
+            "team_leaderboard": league_leaderboard,
+            "leagueRosters": all_teams,
+            "allTeams": all_teams,
+            "playoff_teams": lg_settings.get("playoff_teams", 6),
+            "playoff_week_start": lg_settings.get("playoff_week_start", 15),
+            "meta": {"rosters": len(rosters) if isinstance(rosters, list) else 0, "players": len(players) if isinstance(players, list) else 0, "week": req_week},
+        }
+        last_modified = formatdate(timeval=now, localtime=False, usegmt=True)
+        if req_week is None:
+            with _CACHE_LOCK:
+                _ROSTERS_FULL_CACHE = {"at": now, "payload": payload, "last_modified": last_modified}
+        self.json(payload, headers={"Cache-Control": "private, max-age=60", "Last-Modified": last_modified})
+
+    def handle_comparison(self, conn, qs):
+        # Model vs Market (Sleeper pts+stats vs FantasyPros ECR/ADP) — built by refresh.py
+        # 60s server-side cache + Last-Modified/304 mirroring rosters-full.
+        global _COMPARISON_CACHE
+        _cnow = time.time()
+        with _CACHE_LOCK:
+            _ccached = _COMPARISON_CACHE.get("payload")
+            _cat = _COMPARISON_CACHE.get("at", 0.0)
+            _clm = _COMPARISON_CACHE.get("last_modified", "")
+            if _ccached is not None and (_cnow - _cat < _COMPARISON_TTL):
+                _cims = self.headers.get("If-Modified-Since")
+                if _cims and _clm and _cims == _clm:
+                    self.send_response(304)
+                    self.send_header("Cache-Control", "private, max-age=60")
+                    self.send_header("Last-Modified", _clm)
+                    self.end_headers()
+                    return
+                _cfull = _ccached.get("players_full") or []
+                _cfetched = _ccached.get("fetched_at")
+                _cedge = (qs.get("edge", [None])[0] or "").upper()
+                _cfiltered = _cfull
+                if _cedge in ("BUY", "SELL", "NEUTRAL"):
+                    _cfiltered = [p for p in _cfull if isinstance(p, dict) and (p.get("edge") or "").upper() == _cedge]
+                _climit = 2000
+                try:
+                    if qs.get("limit", [None])[0]:
+                        _climit = max(10, min(2000, int(qs.get("limit")[0])))
+                except Exception:
+                    pass
+                self.json({"players": _cfiltered[:_climit], "count": len(_cfiltered), "fetched_at": _cfetched, "meta": {"source": "market_consensus", "preseason_note": "Market pts empty until Week 1 publish; rank comparison (ECR/ADP) works now."}}, headers={"Cache-Control": "private, max-age=60", "Last-Modified": _clm})
+                return
+        row = None
+        fetched_at = None
+        try:
+            row = try_fetch_one(conn, "SELECT data, fetched_at FROM market_consensus ORDER BY fetched_at DESC LIMIT 1")
+        except Exception:
+            row = None
+        players = []
+        if row:
+            players = load_json_blob(row, key="data") or []
+            fetched_at = row["fetched_at"] if "fetched_at" in row.keys() else None
+        # fallback: if empty, report meta so UI can degrade gracefully
+        if not isinstance(players, list):
+            players = []
+
+        # Enrich every row with sleeper_id (same map /projections uses).
+        # Cached comparison rows may predate the backend fix that emits sleeper_id;
+        # without this, playerAvatar() falls back to the letter initial.
+        # Sleeper via startup-warmed TTL cache (never holds _CACHE_LOCK across I/O).
+        _sleeper_players = get_sleeper_players_cached()
+
+        gsis_to_sleeper = {}
+        name_team_pos_to_sleeper = {}
+        gsis_to_espn = {}
+        name_team_pos_to_espn = {}
+        name_pos_to_sleeper = {}
+        name_pos_to_espn = {}
+        for sid, sp in (_sleeper_players.items() if isinstance(_sleeper_players, dict) else []):
+            if not isinstance(sp, dict):
+                continue
+            g = sp.get("gsis_id")
+            gs = str(g).strip() if g else ""
+            if gs: gsis_to_sleeper[gs] = str(sid)
+            # why espn second map: see /projections builder above — feeds the
+            # ESPN-headshot fallback in playerAvatar.js for unmapped players.
+            # why strip + _norm_n: Sleeper ships ~866 gsis_ids with a leading
+            # space and strips name suffixes ("Michael Penix" vs nflverse
+            # "Michael Penix Jr.") — raw compare misses both classes.
+            e = sp.get("espn_id")
+            es = str(e).strip() if e else ""
+            if gs and es: gsis_to_espn[gs] = es
+            # Also build name+team+pos -> sleeper_id for fallback lookup
+            nm = _norm_n(sp.get("full_name") or f"{sp.get('first_name','')} {sp.get('last_name','')}".strip())
+            tm = (sp.get("team") or "").upper()
+            ps = (sp.get("position") or "").upper()
+            # why FB->RB: see /projections builder above (fullback taxonomy gap).
+            if ps == "FB":
+                ps = "RB"
+            if nm and tm and ps:
+                name_team_pos_to_sleeper[(nm, tm, ps)] = str(sid)
+                if es: name_team_pos_to_espn[(nm, tm, ps)] = es
+            # why team-agnostic tier: see /projections builder above — photo
+            # follows the person, not the (possibly stale) team.
+            if nm and ps:
+                if tm and (nm, ps) not in name_pos_to_sleeper:
+                    name_pos_to_sleeper[(nm, ps)] = str(sid)
+                    if es: name_pos_to_espn[(nm, ps)] = es
+                elif not tm:
+                    name_pos_to_sleeper.setdefault((nm, ps), str(sid))
+                    if es: name_pos_to_espn.setdefault((nm, ps), es)
+
+        for p in players:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("player_id") or "").strip()
+            if not p.get("sleeper_id"):
+                # Try GSIS map first
+                sleeper_id = gsis_to_sleeper.get(pid)
+                if not sleeper_id:
+                    # Fallback: name+team+pos lookup (normalize team abbrevs)
+                    nm = _norm_n(p.get("player_name") or "")
+                    tm = _normalize_team_abbrev(p.get("team") or "")
+                    ps = (p.get("position") or "").upper()
+                    if nm and tm and ps:
+                        sleeper_id = name_team_pos_to_sleeper.get((nm, tm, ps))
+                    if not sleeper_id and nm and ps:
+                        sleeper_id = name_pos_to_sleeper.get((nm, ps))
+                if sleeper_id:
+                    p["sleeper_id"] = sleeper_id
+            if not p.get("espn_id"):
+                espn_id = gsis_to_espn.get(pid)
+                if not espn_id:
+                    nm = _norm_n(p.get("player_name") or "")
+                    tm = _normalize_team_abbrev(p.get("team") or "")
+                    ps = (p.get("position") or "").upper()
+                    if nm and tm and ps:
+                        espn_id = name_team_pos_to_espn.get((nm, tm, ps))
+                    if not espn_id and nm and ps:
+                        espn_id = name_pos_to_espn.get((nm, ps))
+                if espn_id:
+                    p["espn_id"] = espn_id
+        _clast = formatdate(timeval=_cnow, localtime=False, usegmt=True)
+        with _CACHE_LOCK:
+            _COMPARISON_CACHE = {"at": _cnow, "payload": {"players_full": players, "fetched_at": fetched_at}, "last_modified": _clast}
+        # optional edge filter ?edge=BUY
+        edge_filter = (qs.get("edge", [None])[0] or "").upper()
+        if edge_filter in ("BUY", "SELL", "NEUTRAL"):
+            players = [p for p in players if (p.get("edge") or "").upper() == edge_filter]
+        # cap
+        limit = 2000
+        try:
+            if qs.get("limit", [None])[0]:
+                limit = max(10, min(2000, int(qs.get("limit")[0])))
+        except Exception:
+            pass
+        self.json({"players": players[:limit], "count": len(players), "fetched_at": fetched_at, "meta": {"source": "market_consensus", "preseason_note": "Market pts empty until Week 1 publish; rank comparison (ECR/ADP) works now."}}, headers={"Cache-Control": "private, max-age=60", "Last-Modified": _clast})
+
+    def handle_waiver(self, conn):
+        # reuse projections but filter to free agents (not rostered)
+        row = try_fetch_one(conn, "SELECT data FROM rosters ORDER BY rowid DESC LIMIT 1")
+        rosters = load_json_blob(row) or []
+        rostered = set()
+        for r in rosters if isinstance(rosters, list) else []:
+            for pid in (r.get("players") or []):
+                rostered.add(str(pid))
+        row = None
+        try:
+            row = try_fetch_one(conn, "SELECT data FROM player_stats WHERE json_array_length(data)>0 ORDER BY season DESC, week DESC, rowid DESC LIMIT 1")
+        except: row = None
+        if not row or not load_json_blob(row):
+            try:
+                for cand in conn.execute("SELECT data FROM player_stats ORDER BY season DESC, week DESC, rowid DESC LIMIT 10").fetchall():
+                    data = load_json_blob(cand)
+                    if isinstance(data, list) and len(data) > 10:
+                        row = cand
+                        break
+            except: pass
+        if not row:
+            row = try_fetch_one(conn, "SELECT data FROM player_stats ORDER BY season DESC, rowid DESC LIMIT 1")
+        players = load_json_blob(row) or []
+        # Sleeper-ID reverse index (norm name + POS) so headshots resolve.
+        # player_stats rows are GSIS-keyed with no Sleeper id.
+        sid_by_name_pos = {}
+        try:
+            for sid, sp in (get_sleeper_players_cached() or {}).items():
+                if not isinstance(sp, dict):
+                    continue
+                nm = sp.get("full_name") or f"{sp.get('first_name', '')} {sp.get('last_name', '')}".strip()
+                ps = (sp.get("position") or "").upper()
+                key = _norm_n(nm or "")
+                if key and ps:
+                    sid_by_name_pos.setdefault((key, ps), str(sid))
+        except Exception:
+            pass
+        recs = []
+        for p in players:
+            pid = str(p.get("player_id") or p.get("id") or "")
+            if pid in rostered:
+                continue
+            # TODO(consistency): waiver scores from raw fantasy_points while
+            # projections/roster prefer model_points with raw fallback; use model
+            # points when present once waiver loads market_consensus (multi-line).
+            pts = float(p.get("fantasy_points") or 0)
+            if pts < 5:  # threshold to avoid noise
+                continue
+            # why fuller fallback chain, not just short_name or pid
+            # (user-caught live bug, 2026-09-10): nflverse gives
+            # short_name=None for some real players while player_display_name
+            # is always filled — this hub-side handler is hand-duplicated
+            # (isolation: hub never imports ffanalytics/api.py), so the same
+            # fallback fix there never reached here. Confirmed live: waiver
+            # showed raw player_id ("00-0038543") instead of a real name.
+            player_name = p.get("short_name") or p.get("player_display_name") or p.get("player_name") or pid
+            pos = (p.get("position") or "UNK").upper()
+            recs.append({"player_id": pid, "player_name": player_name, "position": pos,
+                         "team": (p.get("team") or p.get("recent_team") or "").upper() or None,
+                         "sleeper_id": sid_by_name_pos.get((_norm_n(player_name), pos)),
+                         "projected_points": round(pts,2), "improvement_over_roster": round(pts*0.8,2), "waiver_priority": 0, "replaces_player_name": None})
+        recs.sort(key=lambda x: x["improvement_over_roster"], reverse=True)
+        for i, r in enumerate(recs[:50]): r["waiver_priority"] = i+1
+        self.json({"recommendations": recs[:50], "meta": {"source": "db:free_agents"}})
+
+    def handle_trade(self, conn, qs):
+        # Hub-side fallback for the Trade tab when :8000 is down (api.js
+        # fetchTrade falls back to /hub-api/trade). ROS-points comparison, NOT
+        # VBD dollars: sums ros_projections.ros_points per side via
+        # sleeper_xwalk. Same fair threshold (+/-5) as
+        # decision.evaluate_trade and same {winner, value_difference,
+        # recommendation} shape trade.js reads. meta.source says fallback so
+        # it never claims model dollars.
+        team_a = (qs.get("team_a_id", [None])[0] or "")
+        team_b = (qs.get("team_b_id", [None])[0] or "")
+        if not team_a or not team_b:
+            self.json({"error": "team_a_id and team_b_id required"}, status=400)
+            return
+        row = try_fetch_one(conn, "SELECT data FROM rosters ORDER BY rowid DESC LIMIT 1")
+        rosters = load_json_blob(row) or []
+
+        def find_roster(tid):
+            for r in (rosters if isinstance(rosters, list) else []):
+                if not isinstance(r, dict):
+                    continue
+                if str(r.get("roster_id") or "") == str(tid) or str(r.get("owner_id") or "") == str(tid):
+                    return r
+            return None
+
+        ra, rb = find_roster(team_a), find_roster(team_b)
+        if ra is None or rb is None:
+            self.json({"error": "unknown team id"}, status=404)
+            return
+        try:
+            xrows = conn.execute("SELECT sleeper_id, gsis_id FROM sleeper_xwalk").fetchall()
+            xwalk = {str(r["sleeper_id"]): str(r["gsis_id"]) for r in xrows if r["sleeper_id"] and r["gsis_id"]}
+        except Exception:
+            xwalk = {}
+        try:
+            rrows = conn.execute("SELECT player_id, ros_points FROM ros_projections").fetchall()
+            ros = {str(r["player_id"]): float(r["ros_points"] or 0) for r in rrows}
+        except Exception:
+            ros = {}
+        if not ros or not xwalk:
+            self.json({"error": "trade fallback cold: no ros/xwalk data"}, status=503)
+            return
+
+        def side_value(roster):
+            total, valued = 0.0, 0
+            for pid in (roster.get("players") or []):
+                g = xwalk.get(str(pid))
+                if g and g in ros:
+                    total += ros[g]
+                    valued += 1
+            return total, valued
+
+        a_pts, a_n = side_value(ra)
+        b_pts, b_n = side_value(rb)
+        diff = a_pts - b_pts
+        if abs(diff) < 5:
+            winner = "Fair"
+            rec = f"Roughly fair (hub fallback ROS diff {abs(diff):.1f} < 5)"
+        elif diff > 0:
+            winner = "Team A"
+            rec = f"Team A leads by {abs(diff):.1f} ROS pts (hub fallback, not VBD dollars)"
+        else:
+            winner = "Team B"
+            rec = f"Team B leads by {abs(diff):.1f} ROS pts (hub fallback, not VBD dollars)"
+        self.json({"winner": winner, "value_difference": round(abs(diff), 2),
+                   "recommendation": rec,
+                   "meta": {"source": "hub-fallback:ros-points", "team_a_valued": a_n, "team_b_valued": b_n}})
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1", help="bind host (127.0.0.1 only)")
+    ap.add_argument("--port", type=int, default=8002, help="bind port")
+    ap.add_argument("--db", default=None, help="path to fantasy.db")
+    args = ap.parse_args()
+
+    if args.host != "127.0.0.1":
+        # No behavior change — warn on clumsy non-loopback --host.
+        logging.warning("hub: --host %s is not loopback; expected 127.0.0.1", args.host)
+        print(f"WARNING: --host {args.host} is not loopback; expected 127.0.0.1")
+    try:
+        db_path = get_db_path(args.db)
+    except ValueError as e:
+        # Generic message — never disclose absolute path; log server-side.
+        logging.error("hub: invalid DB path: %s", e)
+        print(f"invalid DB path: {e}")
+        raise SystemExit(2)
+    Handler.db_path = db_path
+    print(f"hub read-only proxy → {db_path} (mode=ro)")
+    print(f"listening on http://{args.host}:{args.port}  (127.0.0.1 only)")
+    print("endpoints: /health, /hub-api/meta, /hub-api/ready, /hub-api/draft, /hub-api/projections, /hub-api/matchups, /hub-api/roster, /hub-api/rosters-full, /hub-api/news, /hub-api/refresh-log, /hub-api/team-ratings, /hub-api/comparison")
+    print("zero writes, zero tokens, read-only")
+    # Startup-warm Sleeper caches in background so request path serves cache.
+    try:
+        warm_sleeper_caches_async()
+    except Exception:
+        pass
+
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down")
+
+if __name__ == "__main__":
+    main()
