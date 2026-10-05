@@ -1,8 +1,13 @@
 # Draftly
 
+![CI](https://github.com/Liam0376/draftly/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Weekly fantasy football projections, start/sit calls, matchup simulations, trade evaluation, and auction drafting. A web app plus the research pipeline behind it.
 
 Live: https://draftly-liamfelixb-9782s-projects.vercel.app
+
+![Projections view: model vs market with buy/sell edges](docs/assets/projections.png)
 
 ## Accuracy
 
@@ -24,6 +29,10 @@ research/          projection pipeline: PBP features, XGBoost residual models,
                    conformal intervals, backtests, weekly grading
                    (Vite UI source in research/hub/)
 ```
+
+Assembled from the project's two original repositories via `git subtree`, one import commit per tree; full development history stays searchable in those two (kept as archives, see [docs/adr/001-canonical-paths.md](docs/adr/001-canonical-paths.md)).
+
+![Trade lab: two-team package evaluation](docs/assets/trade.png)
 
 ## Running
 
