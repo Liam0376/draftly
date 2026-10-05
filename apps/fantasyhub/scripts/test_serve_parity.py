@@ -1,0 +1,206 @@
+"""Serve<->training parity: compute_week.py must build ML features with
+the exact formulas build_training_data.py used (Phase C audit).
+
+Method: swap compute_week.ml_predict with a recorder, run
+compute_projections on fixture CSV-like rows, assert the recorded
+feature dict matches the training definition. One test per skew.
+"""
+import sys
+import os
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "api"))
+sys.path.insert(0, str(Path(__file__).parent))
+
+import compute_week
+from build_training_data import weighted_avg, linear_trend
+from scoring import REF_SCORING, score_avg_stats
+
+
+def _qb_rows(pid="QB1"):
+    rows = []
+    for w, yds, tds in ((1, 250, 2), (2, 300, 3), (3, 200, 1)):
+        rows.append({
+            "player_id": pid, "player_display_name": "Test QB",
+            "position": "QB", "team": "BUF", "opponent_team": "MIA",
+            "season": 2026, "season_type": "REG", "week": w,
+            "passing_yards": str(yds), "passing_tds": str(tds),
+            "passing_interceptions": "1", "rushing_yards": "10",
+            "rushing_tds": "0", "fumbles_lost_total": "0",
+        })
+    return rows
+
+
+def _qb_rows_7(pid="QB7"):
+    rows = []
+    for w in range(1, 8):
+        rows.append({
+            "player_id": pid, "player_display_name": "Test QB7",
+            "position": "QB", "team": "BUF", "opponent_team": "MIA",
+            "season": 2026, "season_type": "REG", "week": w,
+            "passing_yards": str(200 + 10 * w), "passing_tds": "2",
+            "passing_interceptions": "1", "rushing_yards": "10",
+            "rushing_tds": "0", "fumbles_lost_total": "0",
+        })
+    return rows
+
+
+def _run_with_recorder(rows, current_week=4, **kw):
+    seen = {}
+
+    def _recorder(feats, pos):
+        seen["feats"] = feats
+        return 0.0
+
+    real = compute_week.ml_predict
+    compute_week.ml_predict = _recorder
+    try:
+        kw.setdefault("pbp_data", {})
+        out = compute_week.compute_projections(
+            rows, current_week=current_week, season=2026, **kw)
+    finally:
+        compute_week.ml_predict = real
+    return out, seen.get("feats", {})
+
+
+def test_c1_curr_ppg_is_weighted_history_not_heuristic():
+    rows = _qb_rows()
+    out, feats = _run_with_recorder(rows)
+    assert feats, "ML block did not run"
+    expected = weighted_avg(
+        [score_avg_stats(g, REF_SCORING, "QB") for g in rows])
+    assert abs(feats["curr_ppg_wavg"] - expected) < 1e-9
+    # Heuristic stays its own feature...
+    assert feats["heuristic_pts"] != feats["curr_ppg_wavg"]
+    # ...and the residual flows to the output entry
+    entry = next(p for p in out if p["player_id"] == "QB1")
+    assert entry["ml_adjustment"] == 0.0  # recorder returns 0.0 residual
+
+
+def test_c2_stat_avgs_are_weighted():
+    rows = _qb_rows_7()
+    _, feats = _run_with_recorder(rows, current_week=8)
+    yds = [float(g["passing_yards"]) for g in rows]
+    assert abs(feats["curr_passing_yards_wavg"] - weighted_avg(yds)) < 1e-9
+    assert abs(weighted_avg(yds) - sum(yds) / len(yds)) > 1e-9  # genuinely differ
+
+
+def test_c2_ppg_block_matches_training():
+    rows = _qb_rows_7()
+    _, feats = _run_with_recorder(rows, current_week=8)
+    ppgs = [score_avg_stats(g, REF_SCORING, "QB") for g in rows]
+    assert abs(feats["curr_ppg_wavg"] - weighted_avg(ppgs)) < 1e-9
+    mean_w = feats["curr_ppg_wavg"]
+    expected_std = (sum((p - mean_w) ** 2 for p in ppgs) / len(ppgs)) ** 0.5
+    assert abs(feats["ppg_std"] - expected_std) < 1e-9
+    assert abs(feats["ppg_trend"] - linear_trend(ppgs[-5:])) < 1e-9
+    assert feats["ppg_max"] == max(ppgs) and feats["ppg_min"] == min(ppgs)
+
+
+def test_c2_pbp_and_snap_are_weighted():
+    rows = _qb_rows_7()
+    pbp = {("QB7", w): {
+        "target_share": 0.0, "rush_share": 0.0, "air_yards_share": 0.0,
+        "snap_share": 0.05 * w, "redzone_targets": 0, "redzone_carries": 0,
+    } for w in range(1, 8)}
+    snap = {("test qb7", "BUF", w): 10.0 * w for w in range(1, 8)}
+    _, feats = _run_with_recorder(rows, current_week=8,
+                                  pbp_data=pbp, snap_data=snap)
+    snaps = [0.05 * w for w in range(1, 8)]
+    assert abs(feats["pbp_snap_share_wavg"] - weighted_avg(snaps)) < 1e-9
+    pcts = [10.0 * w for w in range(1, 8)]
+    assert abs(feats["snap_pct_wavg"] - weighted_avg(pcts)) < 1e-9
+
+
+def test_c3_postseason_excluded_from_prior_history():
+    cur = [dict(_qb_rows()[0], week=1)]
+    prior = [
+        dict(_qb_rows()[0], week=5, season=2025, season_type="REG"),
+        dict(_qb_rows()[0], week=20, season=2025, season_type="POST"),
+    ]
+    _, prior_hist = compute_week.fetch_current_and_prior_season_history(
+        cur, prior, current_week=4, season=2026)
+    weeks = [int(g["week"]) for g in prior_hist["QB1"]]
+    assert weeks == [5], f"postseason leaked: {weeks}"
+
+
+def test_c4_snap_uses_per_week_team():
+    rows = _qb_rows_7(pid="QBT")
+    for g in rows:
+        g["player_display_name"] = "Trade QB"
+    for g in rows[:2]:
+        g["team"] = "AAA"
+    for g in rows[2:]:
+        g["team"] = "BBB"
+    snap = {}
+    for w in (1, 2):
+        snap[("trade qb", "AAA", w)] = 50.0 + 10 * w  # 60, 70
+    for w in range(3, 8):
+        snap[("trade qb", "BBB", w)] = 50.0 + 10 * w  # 80..120
+    _, feats = _run_with_recorder(rows, current_week=8, snap_data=snap)
+    all_vals = [50.0 + 10 * w for w in range(1, 8)]
+    bbb_only = [50.0 + 10 * w for w in range(3, 8)]
+    assert abs(feats["snap_pct_wavg"] - weighted_avg(all_vals)) < 1e-9
+    assert abs(weighted_avg(all_vals) - weighted_avg(bbb_only)) > 1e-9
+
+
+def test_c5_pbp_keyed_by_row_id_and_name_gap_pinned():
+    # Rows carrying GSIS ids match PBP rows keyed by (gsis_id, week)
+    rows = _qb_rows_7(pid="QBP")
+    pbp = {("QBP", w): {
+        "target_share": 0.1 * w, "rush_share": 0.0, "air_yards_share": 0.0,
+        "snap_share": 0.0, "redzone_targets": 0, "redzone_carries": 0,
+    } for w in range(1, 8)}
+    _, feats = _run_with_recorder(rows, current_week=8, pbp_data=pbp)
+    assert abs(feats["pbp_target_share_wavg"]
+               - weighted_avg([0.1 * w for w in range(1, 8)])) < 1e-9
+    # Purely name-keyed groups (no ids) cannot match GSIS-keyed PBP:
+    # honestly zero, matching training which excludes such players.
+    nameless = []
+    for g in _qb_rows_7(pid=""):
+        g = dict(g)
+        g.pop("player_id", None)
+        g["player_name"] = "Nick Name"
+        nameless.append(g)
+    _, feats2 = _run_with_recorder(nameless, current_week=8, pbp_data=pbp)
+    assert feats2["pbp_target_share_wavg"] == 0.0
+
+
+def test_roster_universe_seeds_no_history_players():
+    # TreVeyon Henderson case: out week 1 (no stat rows at all) but
+    # rostered+active week 2 -> priors-based projection, not absence.
+    hist = _qb_rows(pid="QB1")
+    ros = [
+        {"week": 2, "season": 2026, "gsis_id": "HEN1", "position": "RB",
+         "team": "NE", "status": "ACT", "full_name": "TreVeyon Henderson"},
+        {"week": 2, "season": 2026, "gsis_id": "IR1", "position": "WR",
+         "team": "NE", "status": "IR", "full_name": "Hurt Player"},
+        {"week": 2, "season": 2026, "gsis_id": "BYE1", "position": "WR",
+         "team": "DAL", "status": "ACT", "full_name": "Bye Player"},
+        {"week": 2, "season": 2026, "gsis_id": "OL1", "position": "T",
+         "team": "NE", "status": "ACT", "full_name": "Tackle Player"},
+        {"week": 2, "season": 2026, "gsis_id": "QB1", "position": "QB",
+         "team": "BUF", "status": "ACT", "full_name": "Test QB"},
+    ]
+    out, _ = _run_with_recorder(hist, current_week=2, byes={"DAL": 2},
+                                roster_rows=ros)
+    by_id = {p["player_id"]: p for p in out}
+    assert "HEN1" in by_id, "active no-history player missing from output"
+    assert by_id["HEN1"]["projected_points"] > 0, "priors should score > 0"
+    assert by_id["HEN1"]["position"] == "RB"
+    assert "IR1" not in by_id, "IR player must not be projected"
+    assert "BYE1" not in by_id, "bye-week player must not be projected"
+    assert "OL1" not in by_id, "non-skill position must not be projected"
+    assert sum(1 for p in out if p["player_id"] == "QB1") == 1, "no dupes"
+
+
+if __name__ == "__main__":
+    test_c1_curr_ppg_is_weighted_history_not_heuristic()
+    test_c2_stat_avgs_are_weighted()
+    test_c2_ppg_block_matches_training()
+    test_c2_pbp_and_snap_are_weighted()
+    test_c3_postseason_excluded_from_prior_history()
+    test_c4_snap_uses_per_week_team()
+    test_c5_pbp_keyed_by_row_id_and_name_gap_pinned()
+    test_roster_universe_seeds_no_history_players()
+    print("OK")

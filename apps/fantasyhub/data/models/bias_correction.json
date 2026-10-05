@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "method": "corrected = predicted - bias[pos][regime], regime = week<=4 early else late",
+  "fitted_on": "disabled 2026-09-29: retrained models (train 2022-2024) have smaller per-position bias; wk1-9 calibration over-estimates early-season bias and over-corrects on wk10-18. Raw ML passes all 3 gates without correction.",
+  "constants": {
+    "QB": {
+      "early": {"bias": 0.0, "n": 0},
+      "late":  {"bias": 0.0, "n": 0}
+    },
+    "RB": {
+      "early": {"bias": 0.0, "n": 0},
+      "late":  {"bias": 0.0, "n": 0}
+    },
+    "WR": {
+      "early": {"bias": 0.0, "n": 0},
+      "late":  {"bias": 0.0, "n": 0}
+    },
+    "TE": {
+      "early": {"bias": 0.0, "n": 0},
+      "late":  {"bias": 0.0, "n": 0}
+    }
+  },
+  "gate_rerun_2025": {
+    "note": "Zeroed; raw ML holdout 2025 from train_model.py: QB delta=-0.781, RB=-0.126, WR=-0.213, TE=-0.081, K=-0.170. Overall ML MAE 4.522 vs H 4.753, pairwise 71.2% vs H 70.2%. All 3 gates pass without correction."
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "functions": {
+    "api/index.py": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {"key": "X-Frame-Options", "value": "DENY"},
+        {"key": "X-Content-Type-Options", "value": "nosniff"},
+        {"key": "Referrer-Policy", "value": "same-origin"},
+        {"key": "X-XSS-Protection", "value": "1; mode=block"}
+      ]
+    }
+  ],
+  "rewrites": [
+    { "source": "/hub-api/(.*)", "destination": "/api/index.py" },
+    { "source": "/recommendations/(.*)", "destination": "/api/index.py" },
+    { "source": "/health", "destination": "/api/index.py" },
+    { "source": "/refresh", "destination": "/api/index.py" },
+    { "source": "/draft", "destination": "/api/index.py" },
+    { "source": "/(.*)", "destination": "/public/index.html" }
+  ]
+}

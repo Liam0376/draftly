@@ -1,0 +1,20 @@
+node_modules/
+.vercel/
+__pycache__/
+*.pyc
+.env
+.env.*
+.DS_Store
+.worktrees/
+.claude/settings.local.json
+.opencode/
+graphify-out/
+*.db
+*.pem
+*.key
+data/models/training_data.jsonl
+
+# vercel build artifacts (regenerated locally, never commit)
+uv.lock
+.python-version
+pyproject.toml
