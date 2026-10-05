@@ -1,0 +1,288 @@
+"""Shared roster enrichment for teams/matchups/trade/waiver endpoints.
+
+Joins three sources, all league-driven:
+- Sleeper rosters (Sleeper player IDs + team-abbr defenses)
+- data/players/latest.json snapshot (Sleeper ID -> name/pos/team)
+- analytics.compute_analytics (league-scored weekly/ROS/VOR/auction)
+
+Slot assignment is greedy by weekly points within each slot's
+eligibility, in canonical roster order.
+"""
+import json
+import os
+from functools import lru_cache
+
+from analytics import _norm_name, _roster_group, compute_analytics
+from league import fetch_league
+from scoring import FLEX_ELIGIBILITY, proj_stat_fields
+
+_PLAYERS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "players", "latest.json")
+_players_map = None
+
+
+def players_map() -> dict:
+    """Sleeper ID -> {n, p, t, r?, do?, dp?}. Cached per instance."""
+    global _players_map
+    if _players_map is None:
+        try:
+            with open(_PLAYERS_PATH) as f:
+                _players_map = json.load(f).get("players", {})
+        except (OSError, json.JSONDecodeError):
+            _players_map = {}
+    return _players_map
+
+
+def scored_index(league_id: str, week=None, season=None):
+    """(analytics payload, {(norm_name, POS): player}, {norm_name: [players]})."""
+    a = compute_analytics(league_id, week=week, season=season)
+    by_np, by_n = {}, {}
+    for p in a["players"]:
+        key = (_norm_name(p.get("player_name", "")), (p.get("position") or "").upper())
+        by_np.setdefault(key, p)
+        by_n.setdefault(key[0], []).append(p)
+    return a, by_np, by_n
+
+
+def _sleeper_extra(meta: dict) -> dict:
+    """Honest Sleeper-native signals from the snapshot (rank/depth).
+    Missing keys stay None — never fabricated, never ECR/ADP."""
+    return {"search_rank": meta.get("r"),
+            "depth_order": meta.get("do"),
+            "depth_position": meta.get("dp")}
+
+
+def resolve_player(sid: str, pmap: dict, by_np: dict, by_n: dict) -> dict:
+    """Enriched player for a Sleeper roster entry. Unknown IDs still
+    render (honest zeros from the snapshot, never dropped)."""
+    # Team defense entries are bare abbreviations ("HOU").
+    if isinstance(sid, str) and sid.isupper() and len(sid) <= 3 and sid.isalpha():
+        hit = by_np.get((_norm_name(sid), "DEF"))
+        if hit:
+            return _enriched(hit, sid, "DEF")
+        return {"player_id": sid, "sleeper_id": sid, "player_name": sid,
+                "position": "DEF", "team": sid, "opponent_team": "",
+                "projected_points": 0.0,
+                "weekly": 0.0, "ros": 0.0, "vor": 0.0, "auction_value": 0,
+                "injury_status": None, "bye_week": None, "width": 0,
+                "lower": 0, "upper": 0, "tier": 0, "edge": "FAIR",
+                "amount_paid": None, "search_rank": None,
+                "depth_order": None, "depth_position": None}
+    meta = pmap.get(str(sid), {})
+    name = meta.get("n", f"Player {sid}")
+    pos = (meta.get("p") or "UNK").upper()
+    hit = by_np.get((_norm_name(name), pos))
+    if hit is None:
+        cands = by_n.get(_norm_name(name), [])
+        hit = cands[0] if cands else None
+    if hit:
+        return {**_enriched(hit, sid, pos), **_sleeper_extra(meta)}
+    return {"player_id": str(sid), "sleeper_id": str(sid), "player_name": name,
+            "position": pos, "team": meta.get("t") or "", "opponent_team": "",
+            "projected_points": 0.0,
+            "weekly": 0.0, "ros": 0.0, "vor": 0.0, "auction_value": 0,
+            "injury_status": None, "bye_week": None, "width": 0,
+            "lower": 0, "upper": 0, "tier": 0, "edge": "FAIR",
+            "amount_paid": None, **_sleeper_extra(meta)}
+
+
+def _enriched(hit: dict, sid: str, pos: str) -> dict:
+    return {"player_id": hit.get("player_id", str(sid)), "sleeper_id": str(sid),
+            "player_name": hit.get("player_name", ""), "position": pos,
+            "team": hit.get("team", ""), "opponent_team": hit.get("opponent_team", ""),
+            "projected_points": hit.get("projected_points", 0),
+            "weekly": hit.get("projected_points", 0), "ros": hit.get("ros_points", 0),
+            "vor": hit.get("vor", 0), "auction_value": hit.get("auction_value", 0),
+            "injury_status": hit.get("injury_status"), "bye_week": hit.get("bye_week"),
+            "remaining_games": hit.get("remaining_games", 0),
+            "width": hit.get("width", 0), "lower": hit.get("projection_lower", 0),
+            "upper": hit.get("projection_upper", 0), "tier": hit.get("tier", 0),
+            "edge": hit.get("edge", "FAIR"), "amount_paid": hit.get("amount_paid"),
+            **proj_stat_fields(hit.get("avg_stats") or {}, pos)}
+
+
+@lru_cache(maxsize=4096)
+def _slot_eligible(pos: str, slot: str) -> bool:
+    """Can this roster group fill this roster slot? Pure function of
+    (pos, slot) — cached because the trade engine calls it millions of
+    times per request through assign_slots."""
+    p = _roster_group(pos)
+    s = (slot or "").upper()
+    if s in FLEX_ELIGIBILITY:
+        return p in {_roster_group(m) for m in FLEX_ELIGIBILITY[s]}
+    return p == _roster_group(s)
+
+
+def assign_slots(players: list, roster_positions: list) -> tuple:
+    """Optimal starting lineup (max total points), canonical labels.
+
+    A slot's value depends only on the player in it (his weekly points),
+    so feasible starter sets form a transversal matroid over slots:
+    processing players in points order with augmenting-path reassignment
+    is exact. The old slot-order greedy parked a QB2 on the bench behind
+    a superflex RB and lost total on that shape.
+
+    Returns (starters, bench) with numbered slots (QB1/RB1/FLEX1/BN1).
+    Reserve/IR entries keep their stash slot and never start.
+    """
+    pool = sorted(players, key=lambda p: (-(p.get("weekly") or 0),
+                                          str(p.get("sleeper_id") or p.get("player_id") or "")))
+    slots = [s for s in (roster_positions or [])
+             if (s or "").upper() not in ("BN", "IR", "TAXI")]
+
+    def _flex_rank(slot) -> int:
+        # Exploration order (not labels): dedicated slots before flex
+        # pools, smaller pools before larger — among equally-scoring
+        # optimal lineups this keeps the natural assignment (best WRs in
+        # WR slots, remainder in FLEX) that the old greedy produced.
+        up = (slot or "").upper()
+        if up in ("BN", "IR", "TAXI"):
+            return 99
+        if up in FLEX_ELIGIBILITY:
+            return 100 + len(FLEX_ELIGIBILITY[up])
+        return 0
+
+    order = sorted(range(len(slots)), key=lambda i: (_flex_rank(slots[i]), i))
+    holder: dict[int, dict] = {}  # slot index -> player
+
+    # Eligible slot indices per position, in exploration order: place()
+    # then scans 3-5 slots instead of all 11. Positions are open-ended
+    # strings, but a league sees a handful — the dict stays tiny.
+    elig: dict[str, list] = {}
+
+    def place(p, seen) -> bool:
+        pos = (p.get("position") or "").upper()
+        lst = elig.get(pos)
+        if lst is None:
+            lst = elig[pos] = [i for i in order if _slot_eligible(pos, slots[i])]
+        for i in lst:
+            if i in seen:
+                continue
+            seen.add(i)
+            cur = holder.get(i)
+            if cur is None or place(cur, seen):
+                holder[i] = p
+                return True
+        return False
+
+    for p in pool:
+        place(p, set())
+
+    # Cosmetic rebalance, total-preserving: when a flex holder and a
+    # dedicated-slot holder can swap, the dedicated slot keeps the better
+    # player (WR slots hold the best WRs, FLEX absorbs the remainder) —
+    # the assignment the old slot-order greedy naturally produced.
+    exact = [i for i in range(len(slots))
+             if (slots[i] or "").upper() not in FLEX_ELIGIBILITY]
+    flex = [i for i in range(len(slots))
+            if (slots[i] or "").upper() in FLEX_ELIGIBILITY]
+
+    def _val(p):
+        return p.get("weekly") or 0
+
+    for _ in range(len(slots) + 1):
+        swapped = False
+        for f in flex:
+            for d in exact:
+                hf, hd = holder.get(f), holder.get(d)
+                if not hf or not hd:
+                    continue
+                if (_slot_eligible(hf.get("position", ""), slots[d])
+                        and _slot_eligible(hd.get("position", ""), slots[f])
+                        and _val(hd) < _val(hf)):
+                    holder[d], holder[f] = hf, hd
+                    swapped = True
+        if not swapped:
+            break
+
+    counters: dict[str, int] = {}
+    used, starters = set(), []
+
+    def label(slot):
+        base = (slot or "").upper()
+        counters[base] = counters.get(base, 0) + 1
+        return base if counters[base] == 1 and base in ("QB", "TE", "K", "DEF") else f"{base}{counters[base]}"
+
+    for i, slot in enumerate(slots):
+        p = holder.get(i)
+        if p is None:
+            continue
+        pid = p.get("sleeper_id", p.get("player_id"))
+        starters.append({**p, "slot": label(slot)})
+        used.add(pid)
+    bench = []
+    for p in pool:
+        pid = p.get("sleeper_id", p.get("player_id"))
+        if pid not in used:
+            bench.append({**p, "slot": f"BN{len(bench) + 1}"})
+    return starters, bench
+
+
+def set_lineup(players: list, sleeper_starters: list, roster_positions: list):
+    """The lineup actually saved in Sleeper, slotted like assign_slots.
+
+    Sleeper's `starters` lines up with the non-bench roster_positions;
+    "0" marks an empty slot. Returns None when no lineup is set so
+    callers can fall back to the optimal assign_slots lineup.
+    """
+    ids = [str(s) for s in (sleeper_starters or [])]
+    if not any(s and s != "0" for s in ids):
+        return None
+    by_id = {str(p.get("sleeper_id")): p for p in players}
+    slots = [s.upper() for s in (roster_positions or []) if s and s.upper() not in ("BN", "IR", "TAXI")]
+    counters: dict[str, int] = {}
+    starters, used = [], set()
+    for slot, sid in zip(slots, ids):
+        counters[slot] = counters.get(slot, 0) + 1
+        label = slot if counters[slot] == 1 and slot in ("QB", "TE", "K", "DEF") else f"{slot}{counters[slot]}"
+        p = by_id.get(sid)
+        if p:
+            starters.append({**p, "slot": label})
+            used.add(sid)
+    rest = sorted((p for p in players if str(p.get("sleeper_id")) not in used),
+                  key=lambda p: -(p.get("weekly") or 0))
+    bench = [{**p, "slot": f"BN{i}"} for i, p in enumerate(rest, 1)]
+    return starters, bench
+
+
+def build_rosters(league_id: str, week=None, season=None) -> dict:
+    """All teams with enriched, slot-assigned players + aggregates."""
+    league = fetch_league(league_id)
+    settings = league["settings"]
+    roster_positions = settings.get("roster_positions", [])
+    analytics, by_np, by_n = scored_index(league_id, week, season)
+    pmap = players_map()
+
+    teams = []
+    for t in league["teams"]:
+        ids = list(t.get("players") or [])
+        enriched = [resolve_player(sid, pmap, by_np, by_n) for sid in ids]
+        # Mark stash: reserve/taxi keep IR tags, never assigned to slots.
+        stash = set(str(x) for x in (t.get("reserve") or []) + (t.get("taxi") or []))
+        active = [p for p in enriched if str(p.get("sleeper_id")) not in stash]
+        stashed = [{**p, "slot": "IR"} for p in enriched if str(p.get("sleeper_id")) in stash]
+        starters, bench = assign_slots(active, roster_positions)
+        starter_pts = round(sum(s.get("weekly") or 0 for s in starters), 1)
+        # starters/bench = optimal (start-sit, rank); set_* = saved Sleeper lineup.
+        set_starters, set_bench = (set_lineup(active, t.get("starters"), roster_positions)
+                                   or (starters, bench))
+        teams.append({
+            "roster_id": t["roster_id"], "owner_id": t.get("owner_id"),
+            "display_name": t.get("display_name"), "team_name": t.get("team_name"),
+            "avatar": t.get("avatar"), "avatar_url": t.get("avatar_url"),
+            "wins": t.get("wins", 0), "losses": t.get("losses", 0),
+            "ties": t.get("ties", 0), "fpts": t.get("fpts", 0),
+            "starters": starters, "bench": bench, "reserve": stashed,
+            "set_starters": set_starters, "set_bench": set_bench,
+            "starter_pts": starter_pts,
+            "total_auction": sum((p.get("auction_value") or 0) for p in enriched),
+        })
+
+    teams.sort(key=lambda t: -t["starter_pts"])
+    for i, t in enumerate(teams):
+        t["rank"] = i + 1
+    return {"league": {"league_id": league_id, "name": league["name"],
+                       "season": league.get("season"),
+                       "settings": settings},
+            "week": analytics["meta"].get("week"),
+            "season_year": analytics["meta"].get("season"),
+            "teams": teams}

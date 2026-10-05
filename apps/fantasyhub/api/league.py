@@ -1,0 +1,197 @@
+"""Fetch league data from Sleeper API."""
+import re
+import requests
+from concurrent.futures import ThreadPoolExecutor
+
+BASE = "https://api.sleeper.app/v1"
+
+
+class LeagueNotFound(Exception):
+    """Sleeper says the league id doesn't exist (HTTP 404).
+
+    Raised instead of letting requests.HTTPError fall through to the
+    index.py catch-all: a bad/old league id is a client error, not a
+    server fault. index.py maps it to 404 {"error": "league_not_found"}.
+    """
+
+
+def fetch_league(league_id: str, include_traded_picks: bool = False) -> dict:
+    """Fetch league settings, rosters, and users from Sleeper."""
+    league_id = str(league_id).strip()
+    if not re.fullmatch(r'\d{1,20}', league_id):
+        raise LeagueNotFound(league_id)
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_league  = ex.submit(requests.get, f"{BASE}/league/{league_id}", timeout=10)
+        f_rosters = ex.submit(requests.get, f"{BASE}/league/{league_id}/rosters", timeout=10)
+        f_users   = ex.submit(requests.get, f"{BASE}/league/{league_id}/users", timeout=10)
+        r_league, r_rosters, r_users = f_league.result(), f_rosters.result(), f_users.result()
+
+    if r_league.status_code == 404:
+        raise LeagueNotFound(league_id)
+    r_league.raise_for_status()
+    league = r_league.json()
+    # Sleeper answers 404 with a literal "null" body for unknown ids on
+    # some edges; a non-dict payload means the same thing.
+    if not isinstance(league, dict):
+        raise LeagueNotFound(league_id)
+    r_rosters.raise_for_status()
+    rosters = r_rosters.json()
+    r_users.raise_for_status()
+    users = r_users.json()
+
+    user_map = {}
+    for u in users:
+        avatar = u.get("avatar")
+        user_map[u["user_id"]] = {
+            "display_name": u.get("display_name") or u.get("username") or "Unknown",
+            "team_name": u.get("metadata", {}).get("team_name") or u.get("display_name") or "Unknown",
+            "avatar": avatar,
+            "avatar_url": f"https://sleepercdn.com/avatars/{avatar}" if avatar else None,
+        }
+
+    teams = []
+    for rost in rosters:
+        rid = str(rost.get("roster_id", ""))
+        owner_id = str(rost.get("owner_id", ""))
+        user_info = user_map.get(owner_id, {})
+        # why nested settings: Sleeper nests W/L/FP under roster.settings,
+        # not top-level — top-level .get() silently yielded 0–0 forever.
+        rs = rost.get("settings") or {}
+        fpts = (rost.get("fpts") if rost.get("fpts") is not None else rs.get("fpts", 0)) or 0
+        fpts_dec = (rost.get("fpts_decimal") if rost.get("fpts_decimal") is not None else rs.get("fpts_decimal", 0)) or 0
+        teams.append({
+            "roster_id": rid,
+            "owner_id": owner_id,
+            "display_name": user_info.get("display_name", f"Team {rid}"),
+            "team_name": user_info.get("team_name", f"Team {rid}"),
+            "avatar": user_info.get("avatar"),
+            "avatar_url": user_info.get("avatar_url"),
+            "players": rost.get("players") or [],
+            "starters": rost.get("starters") or [],
+            "reserve": rost.get("reserve") or [],
+            "taxi": rost.get("taxi") or [],
+            "wins": rost.get("wins") if rost.get("wins") is not None else rs.get("wins", 0),
+            "losses": rost.get("losses") if rost.get("losses") is not None else rs.get("losses", 0),
+            "ties": rost.get("ties") if rost.get("ties") is not None else rs.get("ties", 0),
+            "fpts": fpts + fpts_dec / 100.0,
+            "fpts_against": rost.get("fpts_against") or rs.get("fpts_against", 0),
+            "fpts_decimal": fpts_dec,
+        })
+
+    scoring = league.get("scoring_settings", {})
+    roster_positions = league.get("roster_positions", [])
+    league_settings = league.get("settings") or {}
+    season_year = str(league.get("season", ""))
+
+    # Drafts: budget, type, status, and actual picks all come from the
+    # drafts endpoint. Prefer the draft matching the league season
+    # (dynasty leagues accumulate old drafts).
+    draft_type = "unknown"
+    draft_status = None
+    draft_id = league.get("draft_id")
+    budget = None
+    budget_source = "none"
+    draft_teams = None
+    draft_rounds = None
+    draft_picks = []
+    try:
+        dr = requests.get(f"{BASE}/league/{league_id}/drafts", timeout=10)
+        drafts = dr.json() if dr.ok else []
+        season_match = [d for d in drafts if str(d.get("season", "")) == season_year]
+        pool = season_match or drafts
+        # Prefer auction when a season has both (startup + rookie).
+        pool = sorted(pool, key=lambda d: 0 if (d.get("type") or "") == "auction" else 1)
+        if pool:
+            d = pool[0]
+            dtype = (d.get("type") or "").lower()
+            dset = d.get("settings") or {}
+            draft_id = d.get("draft_id") or draft_id
+            draft_status = d.get("status")
+            draft_rounds = dset.get("rounds")
+            draft_teams = int(dset.get("teams") or 0) or draft_teams
+            if dtype == "auction":
+                draft_type = "auction"
+                if dset.get("budget"):
+                    budget = int(dset["budget"])
+                    budget_source = "draft"
+            elif dtype in ("snake", "linear"):
+                draft_type = dtype
+    except Exception:
+        pass
+    if budget is None:
+        # Auction without readable budget (shouldn't happen) falls back
+        # to the Sleeper default and says so; snake has no budget.
+        if draft_type == "auction":
+            budget, budget_source = 200, "default"
+        else:
+            budget, budget_source = 0, "none"
+
+    # Actual draft results (auction amounts / snake order) for model-vs-paid.
+    if draft_id:
+        try:
+            pr = requests.get(f"{BASE}/draft/{draft_id}/picks", timeout=15)
+            if pr.ok:
+                for p in pr.json() or []:
+                    md = p.get("metadata") or {}
+                    draft_picks.append({
+                        "player_id": p.get("player_id"),
+                        "first_name": md.get("first_name", ""),
+                        "last_name": md.get("last_name", ""),
+                        "position": md.get("position", ""),
+                        "team": md.get("team", ""),
+                        "amount": p.get("metadata", {}).get("amount"),
+                        "bid_amount": p.get("bid_amount"),
+                        "pick_no": p.get("pick_no"),
+                        "round": p.get("round"),
+                        "draft_slot": p.get("draft_slot"),
+                        "is_keeper": p.get("is_keeper"),
+                    })
+        except Exception:
+            pass
+
+    # Traded picks (future draft capital) — opt-in: only the trade
+    # engine needs them, so no other endpoint pays the extra call.
+    traded_picks = []
+    if include_traded_picks:
+        try:
+            tr = requests.get(f"{BASE}/league/{league_id}/traded_picks", timeout=10)
+            if tr.ok:
+                for p in tr.json() or []:
+                    traded_picks.append({
+                        "season": p.get("season"),
+                        "round": p.get("round"),
+                        "roster_id": str(p.get("roster_id") or ""),
+                        "previous_owner_id": str(p.get("previous_owner_id") or ""),
+                        "new_owner_id": str(p.get("new_owner_id") or ""),
+                    })
+        except Exception:
+            pass
+
+    return {
+        "league_id": league_id,
+        "name": league.get("name", "Unknown League"),
+        "season": int(league.get("season", 2026)),
+        "status": league.get("status"),
+        "sport": league.get("sport"),
+        "settings": {
+            "scoring": scoring,
+            "roster_positions": roster_positions,
+            "budget": budget,
+            "budget_source": budget_source,
+            "draft_type": draft_type,
+            "draft_status": draft_status,
+            "draft_rounds": draft_rounds,
+            "num_teams": league.get("total_rosters") or draft_teams or len(teams),
+            "waiver_budget": league_settings.get("waiver_budget"),
+            "waiver_type": league_settings.get("waiver_type"),
+            "type": league_settings.get("type", 0),
+            "trade_deadline": league_settings.get("trade_deadline"),
+            "playoff_round_type": league_settings.get("playoff_round_type"),
+            "playoff_teams": league_settings.get("playoff_teams") or 6,
+            "playoff_week_start": league_settings.get("playoff_week_start") or 15,
+        },
+        "teams": teams,
+        "draft_picks": draft_picks,
+        "traded_picks": traded_picks,
+    }
