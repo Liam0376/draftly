@@ -13,6 +13,10 @@ on:
         description: 'NFL season year'
         required: false
 
+defaults:
+  run:
+    working-directory: apps/fantasyhub
+
 permissions:
   contents: write
   issues: write

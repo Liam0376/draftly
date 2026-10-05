@@ -11,6 +11,7 @@ nflreadpy>=0.1
 requests>=2.32
 pydantic>=2.9
 pytest>=8.3
+httpx2>=2.12  # starlette.testclient import
 # ml extras: pip install -e .[ml]
 # xgboost>=2.0
 # scikit-learn>=1.4
