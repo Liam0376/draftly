@@ -1,5 +1,5 @@
 import { fetchProjections, fetchComparison, fetchRoster, fetchRosProjections, fetchNews } from '../api.js';
-import { filterPlayers } from '../search.js';
+import { filterPlayers, toggleListValue } from '../search.js';
 import { posBadge, injuryBadge, confBadge, matchupBadge } from '../components/badges.js';
 import { intervalBar } from '../components/intervalBar.js';
 import { playerAvatar } from '../components/playerAvatar.js';
@@ -465,11 +465,22 @@ export async function renderProjections(root) {
     local.value = currentQuery;
     local.addEventListener('input', debounce(()=>{ currentQuery = local.value; currentPage = 1; renderTable(); syncHash(); }, 150));
   }
+  function syncChips() {
+    // Reflect multi-select state: pos:QB,RB lights both chips.
+    root.querySelectorAll('[data-chip]').forEach(b => {
+      b.classList.toggle('active', currentQuery.includes(b.getAttribute('data-chip')));
+    });
+  }
   root.querySelectorAll('[data-chip]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const chip = btn.getAttribute('data-chip');
-      const has = currentQuery.includes(chip);
-      currentQuery = has ? currentQuery.replace(chip,'').replace(/\s{2,}/g,' ').trim() : (currentQuery ? `${currentQuery} ${chip}` : chip);
+      const posM = chip.match(/^pos:(.+)$/i);
+      if (posM) {
+        currentQuery = toggleListValue(currentQuery, 'pos', posM[1]);
+      } else {
+        const has = currentQuery.includes(chip);
+        currentQuery = has ? currentQuery.replace(chip,'').replace(/\s{2,}/g,' ').trim() : (currentQuery ? `${currentQuery} ${chip}` : chip);
+      }
       currentPage = 1;
       if(local) local.value = currentQuery;
       renderTable(); syncHash();
@@ -705,6 +716,7 @@ export async function renderProjections(root) {
         pag.querySelector('#lastPageBtn')?.addEventListener('click', ()=>{ if (currentPage < totalPages) { currentPage = totalPages; renderTable(); } });
       }
     }
+    syncChips();
   }
 
   function syncHash(){

@@ -76,7 +76,9 @@ export function matchesPlayer(p, parsed) {
   }
   for (const [k, { op, value }] of Object.entries(chips)) {
     if (k === 'pos' || k === 'position') {
-      if ((p.position || p.position_group || '').toLowerCase() !== value.toLowerCase()) return false;
+      // Comma list ORs: pos:QB,RB matches either (chip multi-select).
+      const want = String(value).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+      if (!want.includes((p.position || p.position_group || '').toLowerCase())) return false;
     } else if (k === 'team') {
       const pTeamAbbr = (p.team || '').toLowerCase();
       const pTeamFullName = (TEAM_NAMES[p.team] || '').toLowerCase();
@@ -129,4 +131,20 @@ export function filterPlayers(players, rawQuery) {
   const parsed = parseQuery(rawQuery);
   if (!parsed.text && Object.keys(parsed.chips).length === 0) return players;
   return players.filter(p => matchesPlayer(p, parsed));
+}
+
+/** Toggle one value in a comma-list chip token (pos:QB + RB -> pos:QB,RB).
+ * Pure helper so chip buttons multi-select instead of last-wins. */
+export function toggleListValue(query, key, value) {
+  const re = new RegExp(`(?:^|\\s)${key}:([^\\s]*)`);
+  const m = String(query || '').match(re);
+  const cur = m ? m[1].split(',').map(v => v.trim()).filter(Boolean) : [];
+  const norm = String(value).trim();
+  const lower = norm.toLowerCase();
+  const next = cur.some(v => v.toLowerCase() === lower)
+    ? cur.filter(v => v.toLowerCase() !== lower)
+    : [...cur, norm];
+  const token = next.length ? `${key}:${next.join(',')}` : '';
+  if (!m) return [String(query || '').trim(), token].filter(Boolean).join(' ');
+  return String(query || '').replace(re, token ? ` ${token} ` : ' ').replace(/\s{2,}/g, ' ').trim();
 }
