@@ -418,8 +418,8 @@ export async function renderProjections(root) {
         <tbody id="projBody"></tbody>
       </table>
     </div>
-    </div>
     <div class="player-cards-grid" id="projCards"></div>
+    </div>
     <div id="paginationControls" style="display:flex; justify:space-between; align-items:center; margin-top:16px; flex-wrap:wrap; gap:8px"></div>
   `;
 

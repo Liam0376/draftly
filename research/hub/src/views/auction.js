@@ -355,7 +355,6 @@ export async function renderAuction(root) {
         </table>
       </div>
     </div>
-    </div>
     <div class="player-cards-grid" id="auctionCards">
       ${(() => {
         let list = filteredPlayers.filter(p => !p.isDrafted);
@@ -363,6 +362,7 @@ export async function renderAuction(root) {
         const { cards } = tableBody(list, compareAuctionEnabled && hasComparison, escapeHtml, hasMarketFields);
         return cards;
       })()}
+    </div>
     </div>
     <div id="playerDetailModal" style="display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.7); backdrop-filter:blur(8px); align-items:center; justify-content:center; padding:16px"><div id="playerDetailContent" style="background:var(--surface); border:1px solid var(--border); border-radius:16px; max-width:640px; width:100%; max-height:90vh; overflow:auto"></div></div>
   `;
