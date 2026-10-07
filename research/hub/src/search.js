@@ -133,6 +133,19 @@ export function filterPlayers(players, rawQuery) {
   return players.filter(p => matchesPlayer(p, parsed));
 }
 
+/** Chip active state for comma-list tokens: substring includes() claims
+ * pos:QB is on inside pos:QB,RB but misses pos:RB. Parse instead. */
+export function isChipActive(query, chip) {
+  const q = String(query || '');
+  const m = String(chip || '').match(/^(\w+)[:><=]+(.+)$/);
+  if (m && ['pos', 'position'].includes(m[1].toLowerCase())) {
+    const pm = q.match(/(?:^|\s)pos:([^\s]*)/i);
+    const cur = pm ? pm[1].split(',').map(v => v.trim().toLowerCase()).filter(Boolean) : [];
+    return cur.includes(m[2].trim().toLowerCase());
+  }
+  return q.includes(chip);
+}
+
 /** Toggle one value in a comma-list chip token (pos:QB + RB -> pos:QB,RB).
  * Pure helper so chip buttons multi-select instead of last-wins. */
 export function toggleListValue(query, key, value) {

@@ -1,5 +1,5 @@
 import { fetchProjections, fetchComparison, fetchRoster, fetchRosProjections, fetchNews } from '../api.js';
-import { filterPlayers, toggleListValue } from '../search.js';
+import { filterPlayers, toggleListValue, isChipActive } from '../search.js';
 import { posBadge, injuryBadge, confBadge, matchupBadge } from '../components/badges.js';
 import { intervalBar } from '../components/intervalBar.js';
 import { playerAvatar } from '../components/playerAvatar.js';
@@ -468,7 +468,7 @@ export async function renderProjections(root) {
   function syncChips() {
     // Reflect multi-select state: pos:QB,RB lights both chips.
     root.querySelectorAll('[data-chip]').forEach(b => {
-      b.classList.toggle('active', currentQuery.includes(b.getAttribute('data-chip')));
+      b.classList.toggle('active', isChipActive(currentQuery, b.getAttribute('data-chip')));
     });
   }
   root.querySelectorAll('[data-chip]').forEach(btn=>{
