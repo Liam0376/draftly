@@ -51,7 +51,7 @@ export function parseQuery(raw) {
         chips[key] = { op, value: v };
         continue;
       }
-      if (['healthy','trending','roster'].includes(key)) {
+      if (['healthy','trending','roster','flex'].includes(key)) {
         chips[key] = { op: ':', value: v.toLowerCase() };
         continue;
       }
@@ -105,6 +105,11 @@ export function matchesPlayer(p, parsed) {
       const want = value === 'true' || value === '1';
       const isRoster = Boolean(p._onRoster);
       if (want !== isRoster) return false;
+    } else if (k === 'flex') {
+      // FLEX-eligible slots take RB/WR/TE (see FLEX_ELIGIBILITY).
+      const want = value === 'true' || value === '1';
+      const isFlex = ['RB', 'WR', 'TE'].includes((p.position || p.position_group || '').toUpperCase());
+      if (want !== isFlex) return false;
     }
   }
   return true;

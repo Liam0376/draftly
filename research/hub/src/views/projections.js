@@ -1,4 +1,4 @@
-import { fetchProjections, fetchComparison, fetchRoster, fetchRosProjections } from '../api.js';
+import { fetchProjections, fetchComparison, fetchRoster, fetchRosProjections, fetchNews } from '../api.js';
 import { filterPlayers } from '../search.js';
 import { posBadge, injuryBadge, confBadge, matchupBadge } from '../components/badges.js';
 import { intervalBar } from '../components/intervalBar.js';
@@ -254,14 +254,30 @@ export async function renderProjections(root) {
     p.tier = p.fp_tier;
   }
 
+  // Trending flags power the trending:true chip (user-caught live bug:
+  // nothing ever set p.trending, so the chip matched zero players).
+  // Sleeper trending adds, matched by id then name|POS. News failure
+  // leaves flags false rather than blocking the board.
+  try {
+    const news = await fetchNews().catch(() => null);
+    const adds = news?.trending_adds || [];
+    const tIds = new Set(adds.map(t => String(t.player_id || '')));
+    const tNames = new Set(adds.map(t => `${normName(t.player_name)}|${(t.position || '').toUpperCase()}`));
+    for (const p of allPlayers) {
+      p.trending = tIds.has(String(p.player_id || '')) || tIds.has(String(p.sleeper_id || ''))
+        || tNames.has(`${normName(p.player_name || '')}|${(p.position || '').toUpperCase()}`);
+    }
+  } catch (_) { /* flags stay false */ }
+
   // sync global search
   const g = document.getElementById('globalSearch');
   if (g && !g.dataset.bound) {
     g.dataset.bound = '1';
-    g.addEventListener('input', debounce(()=>{ currentQuery = g.value; currentPage = 1; renderTable(); syncHash(); }, 150));
+    g.addEventListener('input', debounce(()=>{ currentQuery = g.value; currentPage = 1; const localBox = root.querySelector('#localSearch'); if (localBox) localBox.value = currentQuery; renderTable(); syncHash(); }, 150));
     g.addEventListener('keydown', e=>{ if(e.key==='/' && document.activeElement!==g){ e.preventDefault(); g.focus(); }});
   }
-  if (g) g.value = currentQuery;
+  // Top bar never shows view filters: sync runs global to local only.
+  // Chip and local-box edits stay in this view's own search box.
 
   // Compute BUY/SELL counts for header
   const buyCount = [...compById.values()].filter(c => c.edge === 'BUY').length;
@@ -350,6 +366,7 @@ export async function renderProjections(root) {
           <button class="chip" data-chip="pos:RB">RB</button>
           <button class="chip" data-chip="pos:WR">WR</button>
           <button class="chip" data-chip="pos:TE">TE</button>
+          <button class="chip" data-chip="flex:true">FLEX</button>
           <button class="chip" data-chip="healthy:true">Healthy</button>
           <button class="chip" data-chip="trending:true">Trending</button>
           <button class="chip" data-chip="roster:true">My Roster</button>
@@ -446,7 +463,7 @@ export async function renderProjections(root) {
   const local = root.querySelector('#localSearch');
   if (local) {
     local.value = currentQuery;
-    local.addEventListener('input', debounce(()=>{ currentQuery = local.value; currentPage = 1; if(g) g.value = currentQuery; renderTable(); syncHash(); }, 150));
+    local.addEventListener('input', debounce(()=>{ currentQuery = local.value; currentPage = 1; renderTable(); syncHash(); }, 150));
   }
   root.querySelectorAll('[data-chip]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
@@ -455,7 +472,6 @@ export async function renderProjections(root) {
       currentQuery = has ? currentQuery.replace(chip,'').replace(/\s{2,}/g,' ').trim() : (currentQuery ? `${currentQuery} ${chip}` : chip);
       currentPage = 1;
       if(local) local.value = currentQuery;
-      if(g) g.value = currentQuery;
       renderTable(); syncHash();
     });
   });
