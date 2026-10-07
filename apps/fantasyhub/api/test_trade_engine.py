@@ -849,6 +849,24 @@ def test_analysis_sentences_plain_and_complete():
         assert bad not in text
 
 
+def test_analysis_names_traded_positions_not_flex_byproducts():
+    # Regression: 2-FLEX league, trading RB for WR. Losing the WR hands a
+    # TE his flex snaps back, so group_delta carries a real TE swing even
+    # though no TE moved. The "stronger at X / thinner at Y" headline must
+    # name the traded groups (RB, WR), never the flex byproduct.
+    from trade_engine import analysis_for
+    block = {"gains": {"raw_total": -3.4, "raw_per_week": -0.3,
+                       "raw_playoffs": -1.0},
+             "needs": [], "direction": "middle",
+             "traded_positions": ["RB", "WR"]}
+    cal = {"weeks_left": [5, 6], "playoff_weeks": []}
+    sents = analysis_for(block, {"TE": 6.7, "RB": 3.0, "WR": -10.1}, "even",
+                         "possible", "X", cal, perspective="me")
+    text = " ".join(sents)
+    assert "stronger at RB" in text and "thinner at WR" in text
+    assert "TE" not in text
+
+
 def test_analysis_losses_and_coin_flip_read_plain():
     from trade_engine import analysis_for
     block = {"gains": {"raw_total": -24.0, "raw_per_week": -8.0,

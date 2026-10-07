@@ -35,14 +35,19 @@ export function impactSvg(before, after, yMax, weeks, playoffWeekStart) {
     + `</svg>`;
 }
 
-/** Diverging green/red bars for per-position lineup deltas. */
-export function groupBars(gd) {
+/** Diverging green/red bars for per-position lineup deltas. Allowed
+ * limits bars to groups the trade exchanged (flex re-slotting moves
+ * untraded groups too). Empty/absent allowed keeps full output. */
+export function groupBars(gd, allowed) {
   if (!gd) return '';
   const rank = ['QB', 'RB', 'WR', 'TE', 'DEF', 'K'];
   const pos = (g) => { const i = rank.indexOf(g); return i < 0 ? 99 : i; };
+  const keep = Array.isArray(allowed) && allowed.length
+    ? new Set(allowed.map((g) => String(g).toUpperCase()))
+    : null;
   const entries = Object.entries(gd)
     .map(([g, v]) => [g, Number(v) || 0])
-    .filter(([, v]) => Math.abs(v) >= 0.05)
+    .filter(([g, v]) => Math.abs(v) >= 0.05 && (!keep || keep.has(String(g).toUpperCase())))
     .sort((a, b) => pos(a[0]) - pos(b[0]));
   if (!entries.length) return '';
   const max = Math.max(...entries.map(([, v]) => Math.abs(v)), 1);
@@ -71,5 +76,9 @@ if (typeof process !== 'undefined' && process.argv[1]
   check(bars.includes('gd-fill pos') && bars.includes('gd-fill neg'), 'bars go both ways');
   check(!bars.includes('>QB<'), 'zero deltas drop out');
   check(groupBars({}) === '' && groupBars(null) === '', 'empty deltas render nothing');
+  const scoped = groupBars({ TE: 6.7, RB: 3.0, WR: -10.1 }, ['RB', 'WR']);
+  check(!scoped.includes('>TE<'), 'untraded groups filter out');
+  check(scoped.includes('>RB<') && scoped.includes('>WR<'), 'traded groups keep bars');
+  check(groupBars({ TE: 6.7 }, []).includes('>TE<'), 'empty allowed keeps full output');
   console.log('tradeViz self-check ok');
 }

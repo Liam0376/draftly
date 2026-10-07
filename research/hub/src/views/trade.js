@@ -550,7 +550,7 @@ function impactSection(blk, yMax, weeks, cal) {
       <span><i class="lg lg-before"></i>before&nbsp;<i class="lg lg-after"></i>after</span>
       <span>${range}${poIdx > 0 ? ' · shaded = playoffs' : ''}</span>
     </div>
-    ${groupBars(blk.group_delta)}`;
+    ${groupBars(blk.group_delta, blk.traded_positions)}`;
 }
 
 function fullRoster(data) {

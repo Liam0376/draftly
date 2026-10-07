@@ -654,8 +654,16 @@ def analysis_for(block: dict, group_delta: dict, band: str, acceptance: str,
         s = ["Your weekly lineup score stays about the same."]
 
     gd = {k: round(v, 1) for k, v in (group_delta or {}).items()}
-    ups = sorted((k for k, v in gd.items() if v >= 0.5), key=lambda k: -gd[k])
-    downs = sorted((k for k, v in gd.items() if v <= -0.5), key=lambda k: gd[k])
+    # Flex re-slotting moves untraded groups too: losing a WR can hand a TE
+    # his flex snaps back. Those swings are real lineup points but not what
+    # the trade exchanged, so the headline only names groups the trade
+    # actually moved players at (TE is not "what you win" in an RB/WR deal).
+    traded = {str(p).upper() for p in (block.get("traded_positions") or [])}
+    scoped = {k: v for k, v in gd.items() if k in traded} if traded else gd
+    ups = sorted((k for k, v in scoped.items() if v >= 0.5),
+                 key=lambda k: -scoped[k])
+    downs = sorted((k for k, v in scoped.items() if v <= -0.5),
+                   key=lambda k: scoped[k])
     if ups and downs:
         s.append(f"You come out stronger at {ups[0]} ({gd[ups[0]]:+.1f}/wk) "
                  f"and thinner at {downs[0]} ({gd[downs[0]]:+.1f}/wk).")
@@ -672,7 +680,7 @@ def analysis_for(block: dict, group_delta: dict, band: str, acceptance: str,
                key=lambda nm: nm.get("gap") or 0, default=None)
     if weak:
         pos = weak["position"]
-        d = gd.get(pos, 0.0)
+        d = scoped.get(pos, 0.0)
         if d >= 0.5:
             line = (f"Fills your need at {pos} — you were starting below "
                     "the league's average there.")
@@ -797,12 +805,15 @@ def evaluate_trade(team_a: dict, team_b: dict, teams: list, league: dict,
                  - out["groups_before"].get(g, 0.0), 1)
         for g in set(out["groups_before"]) | set(out["groups_after"])}
     gd_a, gd_b = gdelta(out_a), gdelta(out_b)
+    tpos = sorted({roster_group((p.get("position") or ""))
+                   for p in (traded_a or []) + (traded_b or [])})
     blk = lambda out, tm, d, g, gd: {"gains": g, "lineup_before": out["before"],
                                      "lineup_after": out["after"],
                                      "drops": out["drops"],
                                      "adds": out["adds"],
                                      "needs": needs_of(tm, teams, have, rp),
-                                     "direction": d, "group_delta": gd}
+                                     "direction": d, "group_delta": gd,
+                                     "traded_positions": tpos}
     blk_a = blk(out_a, team_a, dir_a, ga, gd_a)
     blk_b = blk(out_b, team_b, dir_b, gb, gd_b)
     tname = lambda t: (t.get("team_name") or t.get("display_name")
