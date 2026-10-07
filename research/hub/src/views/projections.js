@@ -366,6 +366,7 @@ export async function renderProjections(root) {
           <button class="chip" data-chip="pos:RB">RB</button>
           <button class="chip" data-chip="pos:WR">WR</button>
           <button class="chip" data-chip="pos:TE">TE</button>
+          <button class="chip" data-chip="pos:DEF">DEF</button>
           <button class="chip" data-chip="flex:true">FLEX</button>
           <button class="chip" data-chip="healthy:true">Healthy</button>
           <button class="chip" data-chip="trending:true">Trending</button>
