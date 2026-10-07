@@ -10,6 +10,7 @@ import { openPlayerModal } from '../components/playerModal.js';
 import { escapeHtml } from '../lib/escape.js';
 import { intervalBounds } from '../lib/intervals.js';
 import { relevanceTier, backupDemote, buildAheadMap } from '../lib/relevance.js';
+import { viewModeChips, applyViewMode, bindViewMode } from '../lib/viewMode.js';
 
 let allPlayers = [];
 let compById = new Map();
@@ -342,6 +343,7 @@ export async function renderProjections(root) {
           <span class="kicker" id="countLabel" style="white-space:nowrap"></span>
           <button class="chip" id="toggleProjSortDir" title="Flip sorting: highest ↔ lowest">↕ Highest → Lowest</button>
           <button class="chip ${rosMode ? 'active' : ''}" id="toggleRos" title="Switch between weekly and rest-of-season projections" style="${rosMode ? 'background:var(--amber-dim); border-color:rgba(245,158,11,0.35); color:var(--amber)' : ''}">${rosMode ? '📅 RoS (×17)' : '📊 Weekly'}</button>
+          ${viewModeChips()}
         </div>
         <div class="filters" id="quickChips">
           <button class="chip" data-chip="pos:QB">QB</button>
@@ -403,6 +405,9 @@ export async function renderProjections(root) {
     <div class="player-cards-grid" id="projCards"></div>
     <div id="paginationControls" style="display:flex; justify:space-between; align-items:center; margin-top:16px; flex-wrap:wrap; gap:8px"></div>
   `;
+
+  applyViewMode(root);
+  bindViewMode(root);
 
   // Toggle compare
   const tgl = root.querySelector('#toggleCompare');

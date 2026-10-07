@@ -6,6 +6,7 @@ import { getTeamColor } from '../components/teamColors.js';
 import { escapeHtml, safeUrl } from '../lib/escape.js';
 import { openPlayerModal } from '../components/playerModal.js';
 import { getSelectedTeamId, setSelectedTeamId, renderTeamSelector, bindTeamSelector } from '../components/teamSelector.js';
+import { viewModeChips, applyViewMode, bindViewMode } from '../lib/viewMode.js';
 
 const POSITIONS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'];
 const SORTS = {
@@ -182,6 +183,7 @@ export async function renderWaiver(root) {
           <select id="waiverSort" class="team-select-dropdown" style="width:auto">
             ${Object.entries(SORTS).map(([key, s]) => `<option value="${key}">${escapeHtml(s.label)}</option>`).join('')}
           </select>
+          ${viewModeChips()}
         </div>
       ` : ''}
       <div class="card-body" id="waiverBoard" style="padding:0">
@@ -191,6 +193,9 @@ export async function renderWaiver(root) {
   `;
 
   bindTeamSelector(() => renderWaiver(root));
+
+  applyViewMode(root);
+  bindViewMode(root);
 
   root.querySelector('#waiverPosFilter')?.addEventListener('change', (e) => { state.pos = e.target.value; redrawBoard(); });
   root.querySelector('#waiverTeamFilter')?.addEventListener('change', (e) => { state.team = e.target.value; redrawBoard(); });

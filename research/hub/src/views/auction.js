@@ -24,6 +24,7 @@ import {
 import { loadDraftState, resetDraftState } from './auction/state.js';
 import { liveAdviceFor } from './auction/bidAdvice.js';
 import { tableHeaders, tableBody, bindTableEvents, showDraftModal, parseSort, sortPlayers } from './auction/table.js';
+import { viewModeChips, applyViewMode, bindViewMode } from '../lib/viewMode.js';
 
 export async function renderAuction(root) {
   const params = new URLSearchParams(location.hash.split('?')[1] || '');
@@ -304,6 +305,8 @@ export async function renderAuction(root) {
           ` : ''}
           <span style="border-left:1px solid var(--border); margin:0 4px"></span>
           <button class="btn btn-ghost btn-sm" id="copyAuction">Copy CSV</button>
+          <span style="border-left:1px solid var(--border); margin:0 4px"></span>
+          ${viewModeChips()}
           <label class="faint" style="font:500 12px Helvetica Neue, Helvetica,sans-serif">
             <input type="checkbox" id="hideDrafted" ${params.get('hide') === '1' ? 'checked' : ''}> hide drafted
           </label>
@@ -363,6 +366,9 @@ export async function renderAuction(root) {
     </div>
     <div id="playerDetailModal" style="display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.7); backdrop-filter:blur(8px); align-items:center; justify-content:center; padding:16px"><div id="playerDetailContent" style="background:var(--surface); border:1px solid var(--border); border-radius:16px; max-width:640px; width:100%; max-height:90vh; overflow:auto"></div></div>
   `;
+
+  applyViewMode(root);
+  bindViewMode(root);
 
   // --- Event handlers (view-level, not table-level) ---
 

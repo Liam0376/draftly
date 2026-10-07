@@ -731,6 +731,15 @@ code.inline { background: var(--surface-raised); border: 1px solid var(--border)
   .responsive-view .player-cards-grid { display: none; }
 }
 
+/* Manual view-mode override (viewMode.js): user pick beats width. Rules
+   sit after the media queries so equal specificity wins; root-scoped so
+   one toggle covers tables and card grids inside and outside
+   .responsive-view (#projCards, #auctionCards). */
+.viewmode-table .table-wrap { display: block !important; }
+.viewmode-table .player-cards-grid { display: none !important; }
+.viewmode-cards .table-wrap { display: none !important; }
+.viewmode-cards .player-cards-grid { display: grid !important; }
+
 /* ═══════════════════════════════════════════════════════
    Print
    ═══════════════════════════════════════════════════════ */

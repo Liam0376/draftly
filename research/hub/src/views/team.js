@@ -13,6 +13,7 @@ import { assignStarterSlots } from '../lib/slots.js';
 import { enrichPlayer } from '../lib/enrichPlayer.js';
 import { beatProb, TOSS_UP_PROB } from '../lib/intervals.js';
 import { escapeHtml, escapeAttr, safeAvatarUrl } from '../lib/escape.js';
+import { viewModeChips, applyViewMode, bindViewMode } from '../lib/viewMode.js';
 
 export async function renderTeam(root) {
   // Bulk-first: single /rosters-full pass; single-fetch only when bulk misses (no N+1).
@@ -314,6 +315,7 @@ export async function renderTeam(root) {
           <h3>Starters (${starters.length} Slots)</h3>
           <span class="kicker">10 Starter Slots · Click any player row or card to open detail breakdown</span>
         </div>
+        <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">${viewModeChips()}</div>
         <span class="badge badge-amber mono" style="font-size:13px; font-weight:700">${totalStarterFPTS.toFixed(1)} Wk Pts</span>
       </div>
       <div class="card-body" style="padding:0">
@@ -439,6 +441,9 @@ export async function renderTeam(root) {
   bindTeamSelector(() => {
     renderTeam(root);
   });
+
+  applyViewMode(root);
+  bindViewMode(root);
 
   // Bind Player Row & Card Clicks to open Draftea Player Detail Modal (mouse + keyboard).
   // Table semantics: <tr> carries data-player-row (no role); inner <button data-player-id>
