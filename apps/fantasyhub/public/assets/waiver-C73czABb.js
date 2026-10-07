@@ -1,10 +1,10 @@
-import{b as R,d as C,c as N,e as E,h as o,L as q,p as y,o as x,r as z,t as b,i as S}from"./index-CFYKaGey.js";import{g as W,s as H,r as O,b as U}from"./teamSelector-BVgj7dqu.js";const M=["QB","RB","WR","TE","K","DEF"],k={improvement_desc:{label:"Δ roster: high to low",cmp:(a,t)=>(t.improvement_over_roster??-1/0)-(a.improvement_over_roster??-1/0)},points_desc:{label:"Proj points: high to low",cmp:(a,t)=>(t.projected_points??-1/0)-(a.projected_points??-1/0)},points_asc:{label:"Proj points: low to high",cmp:(a,t)=>(a.projected_points??1/0)-(t.projected_points??1/0)}};function L(a){return a.length?`
+import{b as R,d as C,c as N,e as E,h as o,L as q,p as y,o as x,r as M,t as b,i as S}from"./index-OzL2Moqf.js";import{g as z,s as W,r as H,b as O}from"./teamSelector-CJqMPfpV.js";import{v as U,a as Q,b as V}from"./viewMode-B4epi5Wn.js";const J=["QB","RB","WR","TE","K","DEF"],k={improvement_desc:{label:"Δ roster: high to low",cmp:(a,t)=>(t.improvement_over_roster??-1/0)-(a.improvement_over_roster??-1/0)},points_desc:{label:"Proj points: high to low",cmp:(a,t)=>(t.projected_points??-1/0)-(a.projected_points??-1/0)},points_asc:{label:"Proj points: low to high",cmp:(a,t)=>(a.projected_points??1/0)-(t.projected_points??1/0)}};function L(a){return a.length?`
     <div class="responsive-view">
       <div class="table-wrap" style="border:0; border-radius:0"><table>
         <thead><tr><th aria-sort="none">#</th><th aria-sort="none">Player</th><th aria-sort="none">Pos</th><th aria-sort="none">Proj</th><th aria-sort="none">Δ roster</th><th aria-sort="none">Replaces</th><th aria-sort="none">Conf</th></tr></thead>
         <tbody>
           ${a.map(t=>`
-            <tr data-pid="${o(t.player_id||"")}" data-team="${t.team||""}" style="--team-accent:${z((t.team||"").toUpperCase())}; cursor:pointer">
+            <tr data-pid="${o(t.player_id||"")}" data-team="${t.team||""}" style="--team-accent:${M((t.team||"").toUpperCase())}; cursor:pointer">
               <td class="mono">${t.waiver_priority??"—"}</td>
               <td><div class="player-cell">${y(t,28)}<div class="player-cell-info"><div class="player-cell-name">${o(t.player_name||t.player_id)}</div><div class="player-cell-sub">${b(t.team,14)} ${o(t.team||"")}</div></div></div></td>
               <td>${S(t.position)}</td>
@@ -36,11 +36,11 @@ import{b as R,d as C,c as N,e as E,h as o,L as q,p as y,o as x,r as z,t as b,i a
         `).join("")}
       </div>
     </div>
-  `:'<div class="empty">No waiver candidates match these filters.</div>'}async function Q(a){var u,w,_;const t=await R().catch(()=>null),d=(t==null?void 0:t.leagueRosters)||(t==null?void 0:t.allTeams)||[];let l=W();!l&&d.length&&(l=String(d[0].roster_id),H(l));const c=d.find(e=>String(e.roster_id)===String(l)),j=(c==null?void 0:c.owner_id)||null,[A,g,F]=await Promise.all([C({owner_id:j}),N(),E({limit:2e3}).catch(()=>({players:[]}))]),s=A.recommendations||[],I=new Map((F.players||[]).map(e=>[String(e.player_id),e]));for(const e of s){const i=I.get(String(e.player_id));i&&(e.market_season_stats=i.market_season_stats||null,e.auction=i.auction,e.modelAuction=i.auction,e.marketAuction=i.marketAuction,e.vor=i.vor)}const p=g.trending_adds||[],f=g.fantasypros_news||[],P=[...new Set(s.map(e=>(e.team||"").toUpperCase()).filter(Boolean))].sort(),n={pos:"ALL",team:"ALL",sort:"improvement_desc"};function T(){return s.filter(e=>n.pos==="ALL"||(e.position||"").toUpperCase()===n.pos).filter(e=>n.team==="ALL"||(e.team||"").toUpperCase()===n.team).sort(k[n.sort].cmp)}function h(e){const i=a.querySelector("#waiverBoard");i&&i.querySelectorAll("[data-pid]").forEach(r=>{r.addEventListener("click",()=>{const m=r.getAttribute("data-pid"),$=e.find(B=>String(B.player_id)===String(m));$&&x($,a)})})}function v(){const e=T(),i=a.querySelector("#waiverBoard"),r=a.querySelector("#waiverCount");i&&(i.innerHTML=L(e)),r&&(r.textContent=s.length?`${e.length} of ${s.length} candidates`:"no data"),h(e)}a.innerHTML=`
+  `:'<div class="empty">No waiver candidates match these filters.</div>'}async function K(a){var u,w,_;const t=await R().catch(()=>null),d=(t==null?void 0:t.leagueRosters)||(t==null?void 0:t.allTeams)||[];let l=z();!l&&d.length&&(l=String(d[0].roster_id),W(l));const c=d.find(e=>String(e.roster_id)===String(l)),j=(c==null?void 0:c.owner_id)||null,[A,g,F]=await Promise.all([C({owner_id:j}),N(),E({limit:2e3}).catch(()=>({players:[]}))]),s=A.recommendations||[],I=new Map((F.players||[]).map(e=>[String(e.player_id),e]));for(const e of s){const i=I.get(String(e.player_id));i&&(e.market_season_stats=i.market_season_stats||null,e.auction=i.auction,e.modelAuction=i.auction,e.marketAuction=i.marketAuction,e.vor=i.vor)}const p=g.trending_adds||[],f=g.fantasypros_news||[],P=[...new Set(s.map(e=>(e.team||"").toUpperCase()).filter(Boolean))].sort(),n={pos:"ALL",team:"ALL",sort:"improvement_desc"};function T(){return s.filter(e=>n.pos==="ALL"||(e.position||"").toUpperCase()===n.pos).filter(e=>n.team==="ALL"||(e.team||"").toUpperCase()===n.team).sort(k[n.sort].cmp)}function h(e){const i=a.querySelector("#waiverBoard");i&&i.querySelectorAll("[data-pid]").forEach(r=>{r.addEventListener("click",()=>{const m=r.getAttribute("data-pid"),$=e.find(B=>String(B.player_id)===String(m));$&&x($,a)})})}function v(){const e=T(),i=a.querySelector("#waiverBoard"),r=a.querySelector("#waiverCount");i&&(i.innerHTML=L(e)),r&&(r.textContent=s.length?`${e.length} of ${s.length} candidates`:"no data"),h(e)}a.innerHTML=`
     <div class="hero reveal in">
       <h1>Waivers</h1>
       <p>Ranked by improvement over roster, not raw points. Free agents only — rostered players never appear here.</p>
-      ${d.length?`<div style="margin-top:8px; max-width:280px">${O(d,l)}</div>`:""}
+      ${d.length?`<div style="margin-top:8px; max-width:280px">${H(d,l)}</div>`:""}
       <details style="margin-top:8px" aria-label="How waiver priority works">
         <summary style="cursor:pointer; font-weight:600" title="Toggle waiver explainer">How priority works</summary>
         <p style="margin-top:8px">Ranked by <code class="inline">improvement_over_roster</code> (<code class="inline">decision.py:get_waiver_priority</code>), not raw points. A 12-pt WR who replaces your 4-pt WR is worth more than a 13-pt QB you don't need.</p>
@@ -79,7 +79,7 @@ import{b as R,d as C,c as N,e as E,h as o,L as q,p as y,o as x,r as z,t as b,i a
         <div class="card-body" style="display:flex; gap:10px; flex-wrap:wrap; padding-bottom:0">
           <select id="waiverPosFilter" class="team-select-dropdown" style="width:auto">
             <option value="ALL">All positions</option>
-            ${M.map(e=>`<option value="${e}">${e}</option>`).join("")}
+            ${J.map(e=>`<option value="${e}">${e}</option>`).join("")}
           </select>
           <select id="waiverTeamFilter" class="team-select-dropdown" style="width:auto">
             <option value="ALL">All NFL teams</option>
@@ -88,10 +88,11 @@ import{b as R,d as C,c as N,e as E,h as o,L as q,p as y,o as x,r as z,t as b,i a
           <select id="waiverSort" class="team-select-dropdown" style="width:auto">
             ${Object.entries(k).map(([e,i])=>`<option value="${e}">${o(i.label)}</option>`).join("")}
           </select>
+          ${U()}
         </div>
       `:""}
       <div class="card-body" id="waiverBoard" style="padding:0">
         ${L(s)}
       </div>
     </div>
-  `,U(()=>Q(a)),(u=a.querySelector("#waiverPosFilter"))==null||u.addEventListener("change",e=>{n.pos=e.target.value,v()}),(w=a.querySelector("#waiverTeamFilter"))==null||w.addEventListener("change",e=>{n.team=e.target.value,v()}),(_=a.querySelector("#waiverSort"))==null||_.addEventListener("change",e=>{n.sort=e.target.value,v()}),h(s),a.querySelectorAll("[data-trending-pid]").forEach(e=>{e.addEventListener("click",()=>{const i=e.getAttribute("data-trending-pid"),r=p.find(m=>String(m.player_id)===String(i));r&&x({player_id:r.player_id,player_name:r.player_name||"",position:r.position||"",team:r.team||""},a)})})}export{Q as renderWaiver};
+  `,O(()=>K(a)),Q(a),V(a),(u=a.querySelector("#waiverPosFilter"))==null||u.addEventListener("change",e=>{n.pos=e.target.value,v()}),(w=a.querySelector("#waiverTeamFilter"))==null||w.addEventListener("change",e=>{n.team=e.target.value,v()}),(_=a.querySelector("#waiverSort"))==null||_.addEventListener("change",e=>{n.sort=e.target.value,v()}),h(s),a.querySelectorAll("[data-trending-pid]").forEach(e=>{e.addEventListener("click",()=>{const i=e.getAttribute("data-trending-pid"),r=p.find(m=>String(m.player_id)===String(i));r&&x({player_id:r.player_id,player_name:r.player_name||"",position:r.position||"",team:r.team||""},a)})})}export{K as renderWaiver};
