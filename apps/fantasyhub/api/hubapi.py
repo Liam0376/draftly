@@ -726,7 +726,10 @@ def hub_trade(league_id: str, team_a_id=None, team_b_id=None, traded_a=None,
                 "market_a": market["value_a"], "market_b": market["value_b"],
                 "market_coverage_a": len(covered_a),
                 "market_coverage_b": len(covered_b),
-                "slots": {"gained_a": max(0, nb - na), "gained_b": max(0, na - nb),
+                # A bench spot opens for the side that SENT more players
+                # than it received (roster shrinks -> FA slot). na/nb are
+                # players A/B give. credit_*_ros sums that side's FA fills.
+                "slots": {"gained_a": max(0, na - nb), "gained_b": max(0, nb - na),
                           "credit_a_ros": sum(a["value"] for a in out["team_a"]["adds"]),
                           "credit_b_ros": sum(b["value"] for b in out["team_b"]["adds"]),
                           "fill_a": [a["player_name"] for a in out["team_a"]["adds"]],

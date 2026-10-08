@@ -108,6 +108,17 @@ def test_contract_legacy_fields_present(monkeypatch):
     assert out.get("cold") is not True
 
 
+def test_bench_spot_credits_team_that_sends_more(monkeypatch):
+    # Bug: 2-for-1 credited the RECEIVING side (which must drop, not add).
+    # The open bench spot belongs to the side that sent more than it got.
+    _wire(monkeypatch)
+    out = hubapi.hub_trade("L", "1", "2",
+                           traded_a=[norm_name("WR A2"), norm_name("bWR A")],
+                           traded_b=[norm_name("WR B1")])
+    assert out["slots"]["gained_a"] == 1
+    assert out["slots"]["gained_b"] == 0
+
+
 def test_market_sums_cover_only(monkeypatch):
     fc = {norm_name("WR A2"): {"v": 8000, "t30": 100, "tier": 1, "adp": None,
                                "roster_pct": 1.0, "msd": 0, "freq": 0.01}}
